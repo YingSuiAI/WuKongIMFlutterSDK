@@ -23,6 +23,25 @@ class WKDBConst {
   static const tableRobot = 'robot';
   static const tableRobotMenu = 'robot_menu';
 
+  static int resolvePayloadContentType(dynamic payload) {
+    dynamic decodedPayload = payload;
+    if (payload is String) {
+      try {
+        decodedPayload = jsonDecode(payload);
+      } catch (_) {
+        return 0;
+      }
+    }
+    if (decodedPayload is! Map) {
+      return 0;
+    }
+    final type = decodedPayload['type'];
+    if (type is String && type.isNotEmpty && num.tryParse(type) == null) {
+      return WkMessageContentType.projectJson;
+    }
+    return readInt(decodedPayload, 'type');
+  }
+
   static WKMsg serializeWKMsg(dynamic data) {
     WKMsg msg = WKMsg();
     msg.messageID = readString(data, 'message_id');

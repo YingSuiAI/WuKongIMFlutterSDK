@@ -182,18 +182,34 @@ class WKSyncMsg {
         msg.channelID == WKIM.shared.options.uid) {
       msg.channelID = msg.fromUID;
     }
+    dynamic decodedPayload;
     if (payload != null) {
-      msg.content = jsonEncode(payload);
-      msg.contentType = WKDBConst.readInt(payload, 'type');
+      decodedPayload = payload;
+      if (payload is String) {
+        msg.content = payload;
+        try {
+          decodedPayload = jsonDecode(payload);
+        } catch (_) {
+          decodedPayload = null;
+        }
+      } else {
+        msg.content = jsonEncode(payload);
+      }
+      msg.contentType = WKDBConst.resolvePayloadContentType(decodedPayload);
+      if (decodedPayload is Map) {
+        WKIM.shared.messageManager.parsingMsg(msg);
+      }
+    } else {
+      WKIM.shared.messageManager.parsingMsg(msg);
     }
-    WKIM.shared.messageManager.parsingMsg(msg);
     // 处理消息回应
     if (reactions != null && reactions!.isNotEmpty) {
       msg.reactionList = getMsgReaction(reactions!);
     }
-    if (msg.contentType != WkMessageContentType.contentFormatError) {
-      msg.messageContent =
-          WKIM.shared.messageManager.getMessageModel(msg.contentType, payload);
+    if (msg.contentType != WkMessageContentType.contentFormatError &&
+        decodedPayload is Map) {
+      msg.messageContent = WKIM.shared.messageManager
+          .getMessageModel(msg.contentType, decodedPayload);
     }
 
     return msg;

@@ -529,7 +529,7 @@ class WKConnectionManager {
     msg.orderSeq = await WKIM.shared.messageManager
         .getMessageOrderSeq(msg.messageSeq, msg.channelID, msg.channelType);
     dynamic contentJson = jsonDecode(msg.content);
-    msg.contentType = WKDBConst.readInt(contentJson, 'type');
+    msg.contentType = WKDBConst.resolvePayloadContentType(contentJson);
     msg.isDeleted = _isDeletedMsg(contentJson);
     msg.messageContent = WKIM.shared.messageManager
         .getMessageModel(msg.contentType, contentJson);
