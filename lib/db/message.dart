@@ -463,7 +463,11 @@ class MessageDB {
       }
     }
     if (!isSyncMsg) {
-      if (minMessageSeq == 1) {
+      // A fresh history request (oldestOrderSeq == 0) must still ask the
+      // installed sync listener for newer messages when local storage starts
+      // at sequence 1. Keep the early return for non-initial pagination so
+      // reaching the beginning of an already loaded history remains local.
+      if (oldestOrderSeq != 0 && minMessageSeq == 1) {
         requestCount = 0;
         iGetOrSyncHistoryMsgBack(list);
         return;
