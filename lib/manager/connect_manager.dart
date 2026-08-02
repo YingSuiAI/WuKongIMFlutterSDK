@@ -22,64 +22,84 @@ import '../proto/proto.dart';
 import '../type/const.dart';
 
 class _WKSocket {
-  Socket? _socket; // 将 _socket 声明为可空类型
+  Socket? _socket;
+  StreamSubscription<Uint8List>? _subscription;
   bool _isListening = false;
-  static _WKSocket? _instance;
+  bool _closed = false;
+  bool _closeNotified = false;
+  Future<void> _writeTail = Future<void>.value();
+  Future<void>? _closeFuture;
   _WKSocket._internal(this._socket);
 
   factory _WKSocket.newSocket(Socket socket) {
-    if (_instance != null) {
-      // 销毁旧的 socket
-      _instance!._destroySocket();
-    }
-    _instance ??= _WKSocket._internal(socket);
-    return _instance!;
+    return _WKSocket._internal(socket);
   }
 
-  /// 内部方法：仅销毁 socket，不清除实例
-  void _destroySocket() {
+  Future<void> close() {
+    final existing = _closeFuture;
+    if (existing != null) {
+      return existing;
+    }
     _isListening = false;
-    try {
-      _socket?.close();
-    } catch (e) {
-      Logs.debug('关闭socket错误: $e');
-    } finally {
-      _socket = null;
+    _closed = true;
+    final subscription = _subscription;
+    _subscription = null;
+    final socket = _socket;
+    _socket = null;
+    if (subscription != null) {
+      unawaited(
+          subscription.cancel().then<void>((_) {}, onError: (error, stack) {
+        Logs.debug('取消socket监听错误: $error');
+      }));
     }
-  }
-
-  void close() {
-    _isListening = false;
-    _instance = null;
-    try {
-      _socket?.close();
-      // _socket?.destroy();
-    } finally {
-      _socket = null; // 现在可以将 _socket 设置为 null
-    }
-  }
-
-  send(Uint8List data) {
-    try {
-      if (_socket?.remotePort != null) {
-        _socket?.add(data); // 使用安全调用操作符
-        return _socket?.flush();
+    socket?.destroy();
+    final closing = () async {
+      try {
+        await _writeTail;
+      } catch (e) {
+        Logs.debug('发送消息时关闭socket错误: $e');
       }
-    } catch (e) {
-      Logs.debug('发送消息错误$e');
-    }
+    }();
+    _closeFuture = closing;
+    return closing;
   }
 
-  void listen(void Function(Uint8List data) onData, void Function() error) {
+  Future<void> send(Uint8List data) {
+    final operation = _writeTail.then((_) async {
+      final socket = _socket;
+      if (_closed || socket == null) {
+        return;
+      }
+      try {
+        socket.add(data);
+        await socket.flush();
+      } catch (e) {
+        Logs.debug('发送消息错误$e');
+      }
+    });
+    // Keep the chain alive even when a previous operation failed.
+    _writeTail = operation.catchError((_) {});
+    return operation;
+  }
+
+  void listen(void Function(Uint8List data) onData, void Function() onClosed) {
     if (!_isListening && _socket != null) {
-      _socket!.listen(onData, onError: (err) {
+      _subscription = _socket!.listen(onData, onError: (err) {
         Logs.debug('socket断开了${err.toString()}');
+        _notifyClosed(onClosed);
       }, onDone: () {
-        // close(); // 关闭和重置 Socket 连接
-        // error();
+        _notifyClosed(onClosed);
       });
       _isListening = true;
     }
+  }
+
+  void _notifyClosed(void Function() onClosed) {
+    if (_closeNotified || _closed) {
+      return;
+    }
+    _closeNotified = true;
+    onClosed();
   }
 }
 
@@ -101,6 +121,9 @@ class WKConnectionManager {
   final LinkedHashMap<int, SendingMsg> _sendingMsgMap = LinkedHashMap();
   HashMap<String, Function(int, int?, ConnectionInfo?)>? _connectionListenerMap;
   _WKSocket? _socket;
+  Timer? _reconnectTimer;
+  int _lifecycleGeneration = 0;
+  bool _wantsConnection = false;
   ConnectivityResult? lastConnectivityResult;
   final Connectivity _connectivity = Connectivity();
 
@@ -139,82 +162,140 @@ class WKConnectionManager {
     if (isNetworkUnavailable) {
       return;
     }
-    disconnect(false);
+    _wantsConnection = true;
     isDisconnection = false;
+    final generation = ++_lifecycleGeneration;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _cacheData = null;
+    _closeAll();
     if (WKIM.shared.options.getAddr != null) {
       WKIM.shared.options.getAddr!((String addr) {
-        _socketConnect(addr);
+        if (_isCurrent(generation)) {
+          _socketConnect(addr, generation);
+        }
       });
     } else {
-      _socketConnect(addr!);
+      _socketConnect(addr!, generation);
     }
   }
 
   disconnect(bool isLogout) {
+    _wantsConnection = false;
     isDisconnection = true;
-    if (_socket != null) {
-      _socket!.close();
+    ++_lifecycleGeneration;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    isNetworkUnavailable = false;
+    isReconnection = false;
+    lastConnectivityResult = null;
+    try {
+      if (isLogout) {
+        WKIM.shared.options.uid = '';
+        WKIM.shared.options.token = '';
+        WKIM.shared.messageManager.updateSendingMsgFail();
+        WKDBHelper.shared.close();
+      }
+    } finally {
+      _closeAll();
+      setConnectionStatus(WKConnectStatus.fail);
     }
-    if (isLogout) {
-      // _isLogout = true;
-      WKIM.shared.options.uid = '';
-      WKIM.shared.options.token = '';
-      WKIM.shared.messageManager.updateSendingMsgFail();
-      WKDBHelper.shared.close();
-    }
-    _closeAll();
-    WKIM.shared.connectionManager.setConnectionStatus(WKConnectStatus.fail);
   }
 
-  _socketConnect(String addr) {
-    Logs.info("连接地址--->$addr");
-    if (addr == '') {
-      _connectFail('连接地址为空');
+  bool _isCurrent(int generation) =>
+      _wantsConnection &&
+      !isDisconnection &&
+      generation == _lifecycleGeneration;
+
+  bool _isCurrentSocket(int? generation, _WKSocket? connectedSocket) {
+    return (generation == null || _isCurrent(generation)) &&
+        (connectedSocket == null || identical(_socket, connectedSocket));
+  }
+
+  _socketConnect(String addr, int generation) {
+    if (!_isCurrent(generation)) {
       return;
     }
-    var addrs = addr.split(":");
-    var host = addrs[0];
-    var port = addrs[1];
-    try {
-      setConnectionStatus(WKConnectStatus.connecting);
-      Socket.connect(host, int.parse(port), timeout: const Duration(seconds: 5))
-          .then((socket) {
-        _socket = _WKSocket.newSocket(socket);
-        _connectSuccess();
-      }).catchError((err) {
-        _connectFail(err);
-      }).onError((err, stackTrace) {
-        _connectFail(err);
-      });
-    } catch (e) {
-      Logs.error(e.toString());
+    Logs.info("连接地址--->$addr");
+    if (addr == '') {
+      _connectFail('连接地址为空', generation);
+      return;
     }
+    () async {
+      try {
+        var addrs = addr.split(":");
+        if (addrs.length != 2) {
+          throw const FormatException('连接地址格式错误');
+        }
+        var host = addrs[0];
+        var port = int.parse(addrs[1]);
+        setConnectionStatus(WKConnectStatus.connecting);
+        final socket = await Socket.connect(host, port,
+            timeout: const Duration(seconds: 5));
+        if (!_isCurrent(generation)) {
+          unawaited(socket.close().then<void>((_) {}, onError: (error, stack) {
+            Logs.debug('关闭过期socket错误: $error');
+          }));
+          return;
+        }
+        _closeAllTransport();
+        _socket = _WKSocket.newSocket(socket);
+        _connectSuccess(generation);
+      } catch (e) {
+        Logs.error(e.toString());
+        _connectFail(e, generation);
+      }
+    }();
   }
 
   // socket 连接成功
-  _connectSuccess() {
+  _connectSuccess(int generation) {
+    if (!_isCurrent(generation)) {
+      return;
+    }
+    final connectedSocket = _socket;
+    if (connectedSocket == null) {
+      return;
+    }
     // 监听消息
-    _socket?.listen((Uint8List data) {
-      _cutDatas(data);
+    connectedSocket.listen((Uint8List data) {
+      if (!_isCurrent(generation) || !identical(_socket, connectedSocket)) {
+        return;
+      }
+      try {
+        _cutDatas(data,
+            generation: generation, connectedSocket: connectedSocket);
+      } catch (e) {
+        Logs.debug('解析socket数据错误: $e');
+        _scheduleReconnect(generation);
+      }
       // _decodePacket(data);
     }, () {
-      if (isDisconnection) {
+      if (!_isCurrent(generation) || !identical(_socket, connectedSocket)) {
         Logs.debug("登出了");
         return;
       }
-      //  isReconnection = true;
-      Future.delayed(Duration(milliseconds: reconnMilliseconds), () {
-        connect();
-      });
+      _scheduleReconnect(generation);
     });
     // 发送连接包
-    _sendConnectPacket();
+    _sendConnectPacket(generation, connectedSocket);
   }
 
-  _connectFail(error) {
-    // _socket?.close();
-    Future.delayed(Duration(milliseconds: reconnMilliseconds), () {
-      connect();
+  _connectFail(error, int generation) {
+    if (_isCurrent(generation)) {
+      _scheduleReconnect(generation);
+    }
+  }
+
+  void _scheduleReconnect(int generation) {
+    if (!_isCurrent(generation) || _reconnectTimer != null) {
+      return;
+    }
+    _reconnectTimer = Timer(Duration(milliseconds: reconnMilliseconds), () {
+      _reconnectTimer = null;
+      if (_isCurrent(generation)) {
+        connect();
+      }
     });
   }
 
@@ -223,7 +304,7 @@ class WKConnectionManager {
   }
 
   Uint8List? _cacheData;
-  _cutDatas(Uint8List data) {
+  _cutDatas(Uint8List data, {int? generation, _WKSocket? connectedSocket}) {
     if (_cacheData == null || _cacheData!.isEmpty) {
       _cacheData = data;
     } else {
@@ -273,7 +354,12 @@ class WKConnectionManager {
           } else {
             Uint8List msg =
                 lastMsgBytes.sublist(0, remainingLength + 1 + bytes.length);
-            _decodePacket(msg);
+            _decodePacket(msg,
+                generation: generation, connectedSocket: connectedSocket);
+            if (!_isCurrentSocket(generation, connectedSocket)) {
+              _cacheData = null;
+              break;
+            }
             Uint8List temps =
                 lastMsgBytes.sublist(msg.length, lastMsgBytes.length);
             _cacheData = lastMsgBytes = temps;
@@ -281,14 +367,21 @@ class WKConnectionManager {
         } else {
           _cacheData = null;
           // 数据包错误，重连
-          connect();
+          if (generation == null) {
+            connect();
+          } else if (_isCurrentSocket(generation, connectedSocket)) {
+            _scheduleReconnect(generation);
+          }
           break;
         }
       }
     }
   }
 
-  _decodePacket(Uint8List data) {
+  _decodePacket(Uint8List data, {int? generation, _WKSocket? connectedSocket}) {
+    if (!_isCurrentSocket(generation, connectedSocket)) {
+      return;
+    }
     var packet = WKIM.shared.options.proto.decode(data);
     Logs.debug('解码出包->$packet');
     unReceivePongCount = 0;
@@ -302,20 +395,32 @@ class WKConnectionManager {
         setConnectionStatus(WKConnectStatus.success,
             reasoncode: connackPacket.reasonCode,
             info: ConnectionInfo(connackPacket.nodeId));
+        if (!_isCurrentSocket(generation, connectedSocket)) {
+          return;
+        }
         // Future.delayed(Duration(seconds: 1), () {
 
         // });
         try {
           WKIM.shared.conversationManager.setSyncConversation(() {
+            if (!_isCurrentSocket(generation, connectedSocket)) {
+              return;
+            }
             setConnectionStatus(WKConnectStatus.syncCompleted);
-            _resendMsg();
+            _resendMsg(
+                generation: generation, connectedSocket: connectedSocket);
           });
         } catch (e) {
           Logs.error(e.toString());
         }
 
-        _startHeartTimer();
-        _startCheckNetworkTimer();
+        if (!_isCurrentSocket(generation, connectedSocket)) {
+          return;
+        }
+        _startHeartTimer(
+            generation: generation, connectedSocket: connectedSocket);
+        _startCheckNetworkTimer(
+            generation: generation, connectedSocket: connectedSocket);
       } else {
         setConnectionStatus(WKConnectStatus.fail,
             reasoncode: connackPacket.reasonCode);
@@ -325,9 +430,13 @@ class WKConnectionManager {
       Logs.debug('收到消息');
       var recvPacket = packet as RecvPacket;
       _verifyRecvMsg(recvPacket);
+      if (!_isCurrentSocket(generation, connectedSocket)) {
+        return;
+      }
       if (!recvPacket.header.noPersist) {
         _sendReceAckPacket(
-            recvPacket.messageID, recvPacket.messageSeq, recvPacket.header);
+            recvPacket.messageID, recvPacket.messageSeq, recvPacket.header,
+            generation: generation, connectedSocket: connectedSocket);
       }
     } else if (packet.header.packetType == PacketType.sendack) {
       var sendack = packet as SendAckPacket;
@@ -339,6 +448,9 @@ class WKConnectionManager {
       }
     } else if (packet.header.packetType == PacketType.disconnect) {
       disconnect(true);
+      if (!_isCurrentSocket(generation, connectedSocket)) {
+        return;
+      }
       // _closeAll();
       setConnectionStatus(WKConnectStatus.kicked);
     } else if (packet.header.packetType == PacketType.pong) {
@@ -353,49 +465,86 @@ class WKConnectionManager {
     // WKIM.shared.messageManager.updateSendingMsgFail();
     _stopCheckNetworkTimer();
     _stopHeartTimer();
-    if (_socket != null) {
-      _socket!.close();
-    }
-
-    // WKDBHelper.shared.close();
+    _closeAllTransport();
   }
 
-  _sendReceAckPacket(BigInt messageID, int messageSeq, PacketHeader header) {
+  void _closeAllTransport() {
+    _cacheData = null;
+    if (_socket != null) {
+      final socket = _socket!;
+      _socket = null;
+      unawaited(socket.close());
+    }
+  }
+
+  _sendReceAckPacket(BigInt messageID, int messageSeq, PacketHeader header,
+      {int? generation, _WKSocket? connectedSocket}) {
     RecvAckPacket ackPacket = RecvAckPacket();
     ackPacket.header.noPersist = header.noPersist;
     ackPacket.header.syncOnce = header.syncOnce;
     ackPacket.header.showUnread = header.showUnread;
     ackPacket.messageID = messageID;
     ackPacket.messageSeq = messageSeq;
-    _sendPacket(ackPacket);
+    _sendPacket(ackPacket,
+        generation: generation, connectedSocket: connectedSocket);
   }
 
-  _sendConnectPacket() async {
-    CryptoUtils.init();
-    var deviceID = await _getDeviceID();
-    var connectPacket = ConnectPacket(
-        uid: WKIM.shared.options.uid!,
-        token: WKIM.shared.options.token!,
-        version: WKIM.shared.options.protoVersion,
-        clientKey: base64Encode(CryptoUtils.dhPublicKey!),
-        deviceID: deviceID,
-        clientTimestamp: DateTime.now().millisecondsSinceEpoch);
-    connectPacket.deviceFlag = WKIM.shared.deviceFlagApp;
-    _sendPacket(connectPacket);
-  }
-
-  _sendPacket(Packet packet) async {
-    var data = WKIM.shared.options.proto.encode(packet);
-    if (!isReconnection) {
-      await _socket?.send(data);
+  Future<void> _sendConnectPacket(
+      int generation, _WKSocket connectedSocket) async {
+    try {
+      CryptoUtils.init();
+      var deviceID = await _getDeviceID();
+      if (!_isCurrentSocket(generation, connectedSocket)) {
+        return;
+      }
+      var connectPacket = ConnectPacket(
+          uid: WKIM.shared.options.uid!,
+          token: WKIM.shared.options.token!,
+          version: WKIM.shared.options.protoVersion,
+          clientKey: base64Encode(CryptoUtils.dhPublicKey!),
+          deviceID: deviceID,
+          clientTimestamp: DateTime.now().millisecondsSinceEpoch);
+      connectPacket.deviceFlag = WKIM.shared.deviceFlagApp;
+      await _sendPacket(connectPacket,
+          generation: generation, connectedSocket: connectedSocket);
+    } catch (e) {
+      Logs.debug('发送连接包错误: $e');
+      if (_isCurrentSocket(generation, connectedSocket)) {
+        _scheduleReconnect(generation);
+      }
     }
   }
 
-  _startCheckNetworkTimer() {
+  Future<void> _sendPacket(Packet packet,
+      {int? generation, _WKSocket? connectedSocket}) async {
+    final target = _socket;
+    if (isReconnection || !_isCurrentSocket(generation, connectedSocket)) {
+      return;
+    }
+    try {
+      var data = WKIM.shared.options.proto.encode(packet);
+      if (!_isCurrentSocket(generation, connectedSocket) ||
+          !identical(_socket, target)) {
+        return;
+      }
+      await target?.send(data);
+    } catch (e) {
+      Logs.debug('发送数据错误: $e');
+    }
+  }
+
+  _startCheckNetworkTimer({int? generation, _WKSocket? connectedSocket}) {
     _stopCheckNetworkTimer();
     checkNetworkTimer = Timer.periodic(checkNetworkSecond, (timer) {
+      final generation = _lifecycleGeneration;
+      if (!_isCurrentSocket(generation, connectedSocket)) {
+        return;
+      }
       var connectivityResult = _connectivity.checkConnectivity();
       connectivityResult.then((value) {
+        if (!_isCurrentSocket(generation, connectedSocket)) {
+          return;
+        }
         /**
          * 经过查阅 connectivity_plus 官方文档和源码确认：                                                                                                   
           checkConnectivity() 返回的 List<ConnectivityResult> 中，ConnectivityResult.none 只会单独出现，不会和其他连接类型（如 wifi、mobile）混合在同一个列表中。官方文档原文：               
@@ -411,7 +560,8 @@ class WKConnectionManager {
           isReconnection = true;
           isNetworkUnavailable = true;
           Logs.debug('网络断开了');
-          _checkSedingMsg();
+          _checkSedingMsg(
+              generation: generation, connectedSocket: connectedSocket);
           setConnectionStatus(WKConnectStatus.noNetwork);
           lastConnectivityResult = ConnectivityResult.none;
         } else {
@@ -428,6 +578,11 @@ class WKConnectionManager {
         if (value.isNotEmpty) {
           lastConnectivityResult = value[0];
         }
+      }).catchError((error) {
+        if (_isCurrentSocket(generation, connectedSocket)) {
+          Logs.debug('检查网络状态错误: $error');
+        }
+        return null;
       });
     });
   }
@@ -442,7 +597,7 @@ class WKConnectionManager {
     }
   }
 
-  _startHeartTimer() {
+  _startHeartTimer({int? generation, _WKSocket? connectedSocket}) {
     _stopHeartTimer();
     heartTimer = Timer.periodic(heartIntervalSecond, (timer) {
       if (unReceivePongCount > 0) {
@@ -453,7 +608,10 @@ class WKConnectionManager {
       }
       Logs.info('ping...');
       unReceivePongCount++;
-      _sendPacket(PingPacket());
+      if (_isCurrentSocket(generation, connectedSocket)) {
+        _sendPacket(PingPacket(),
+            generation: generation, connectedSocket: connectedSocket);
+      }
     });
   }
 
@@ -587,13 +745,14 @@ class WKConnectionManager {
     return isDelete;
   }
 
-  _resendMsg() async {
+  _resendMsg({int? generation, _WKSocket? connectedSocket}) async {
     _removeSendingMsg();
     if (_sendingMsgMap.isNotEmpty) {
       for (var entry in _sendingMsgMap.entries) {
         if (entry.value.isCanResend) {
           Logs.debug("重发消息：${entry.value.sendPacket.clientSeq}");
-          await _sendPacket(entry.value.sendPacket);
+          await _sendPacket(entry.value.sendPacket,
+              generation: generation, connectedSocket: connectedSocket);
         }
       }
     }
@@ -620,7 +779,7 @@ class WKConnectionManager {
     }
   }
 
-  _checkSedingMsg() {
+  _checkSedingMsg({int? generation, _WKSocket? connectedSocket}) {
     if (_sendingMsgMap.isNotEmpty) {
       final it = _sendingMsgMap.entries.iterator;
       while (it.moveNext()) {
@@ -637,7 +796,8 @@ class WKConnectionManager {
                 (DateTime.now().millisecondsSinceEpoch / 1000).truncate();
             wkSendingMsg.sendCount++;
             _sendingMsgMap[key] = wkSendingMsg;
-            _sendPacket(wkSendingMsg.sendPacket);
+            _sendPacket(wkSendingMsg.sendPacket,
+                generation: generation, connectedSocket: connectedSocket);
             Logs.debug("消息发送失败，尝试重发中...");
           }
         }
