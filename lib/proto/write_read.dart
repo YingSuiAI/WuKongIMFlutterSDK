@@ -6,6 +6,8 @@ class ReadData {
   ByteData? _byteData;
   int offset = 0;
 
+  int get remainingLength => _data.length - offset;
+
   ReadData(this._data) {
     _byteData = ByteData.view(_data.buffer);
   }
@@ -65,6 +67,9 @@ class ReadData {
     var multiplier = 0;
     var rLength = 0;
     while (multiplier < 27) {
+      if (remainingLength == 0) {
+        return -1;
+      }
       var b = readUint8();
       /* tslint:disable */
       rLength = rLength | ((b & 127) << multiplier);

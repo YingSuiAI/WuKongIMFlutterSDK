@@ -14,6 +14,7 @@ import 'package:wukongimfluttersdk/type/const.dart';
 
 import 'common/options.dart';
 import 'manager/connect_manager.dart';
+import 'manager/event_manager.dart';
 import 'model/wk_card_content.dart';
 
 class WKIM {
@@ -28,6 +29,7 @@ class WKIM {
   Future<bool> setup(Options opts) async {
     options = opts;
     deviceFlagApp = opts.deviceFlag;
+    eventManager.reset();
     _initNormalMsgContent();
     if (isApp()) {
       bool result = await WKDBHelper.shared.init();
@@ -77,6 +79,7 @@ class WKIM {
   }
 
   WKConnectionManager connectionManager = WKConnectionManager.shared;
+  WKEventManager eventManager = WKEventManager.shared;
   WKMessageManager messageManager = WKMessageManager.shared;
   WKConversationManager conversationManager = WKConversationManager.shared;
   WKChannelManager channelManager = WKChannelManager.shared;
