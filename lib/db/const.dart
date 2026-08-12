@@ -70,19 +70,27 @@ class WKDBConst {
     msg.wkMsgExtra = serializeMsgExtra(data);
     msg.localExtraMap = readJsonValue(data, 'extra');
     if (msg.content != '') {
-      dynamic contentJson = jsonDecode(msg.content);
-      if (contentJson != null && contentJson != '') {
-        msg.messageContent = WKIM.shared.messageManager
-            .getMessageModel(msg.contentType, contentJson);
-      } else {
+      try {
+        dynamic contentJson = jsonDecode(msg.content);
+        if (contentJson != null && contentJson != '') {
+          msg.messageContent = WKIM.shared.messageManager
+              .getMessageModel(msg.contentType, contentJson);
+        } else {
+          msg.messageContent = WKUnknownContent();
+        }
+      } catch (_) {
         msg.messageContent = WKUnknownContent();
       }
     }
     if (msg.wkMsgExtra!.contentEdit != '') {
-      dynamic json = jsonDecode(msg.wkMsgExtra!.contentEdit);
-      if (json != null && json != '') {
-        msg.wkMsgExtra!.messageContent = WKIM.shared.messageManager
-            .getMessageModel(WkMessageContentType.text, json);
+      try {
+        dynamic json = jsonDecode(msg.wkMsgExtra!.contentEdit);
+        if (json != null && json != '') {
+          msg.wkMsgExtra!.messageContent = WKIM.shared.messageManager
+              .getMessageModel(WkMessageContentType.text, json);
+        }
+      } catch (_) {
+        // 解码失败，忽略
       }
     }
 
@@ -108,7 +116,7 @@ class WKDBConst {
     return extra;
   }
 
-  static WKMsgReaction serializeMsgReation(dynamic data) {
+  static WKMsgReaction serializeMsgReaction(dynamic data) {
     WKMsgReaction reaction = WKMsgReaction();
     reaction.channelID = readString(data, 'channel_id');
     reaction.channelType = readInt(data, 'channel_type');
@@ -250,7 +258,7 @@ class WKDBConst {
 
   static int readInt(dynamic data, String key) {
     dynamic result = data[key];
-    if (result == Null || result == null) {
+    if (result == null) {
       return 0;
     }
     if (result is int) {
@@ -267,7 +275,7 @@ class WKDBConst {
 
   static String readString(dynamic data, String key) {
     dynamic result = data[key];
-    if (result == Null || result == null) {
+    if (result == null) {
       return '';
     }
     return result.toString();
@@ -291,7 +299,7 @@ class WKDBConst {
     try {
       final parsed = json.decode(str);
       return parsed is Map || parsed is List;
-    } on FormatException {
+    } catch (_) {
       return false;
     }
   }
