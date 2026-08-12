@@ -283,24 +283,48 @@ void main() {
     expect(
       manager.completeGapRecovery(
         gaps.single,
-        missingEventAuthoritySequence: 40,
-        snapshotAuthoritySequence: 39,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'run-snapshot-test',
+          authoritySequence: 39,
+          state: 'running',
+        ),
       ),
       isFalse,
     );
     expect(
       manager.completeGapRecovery(
         gaps.single,
-        missingEventAuthoritySequence: 39,
-        snapshotAuthoritySequence: 40,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'another-run',
+          authoritySequence: 40,
+          state: 'running',
+        ),
       ),
       isFalse,
     );
     expect(
       manager.completeGapRecovery(
         gaps.single,
-        missingEventAuthoritySequence: 40,
-        snapshotAuthoritySequence: 40,
+        WKEventRecoverySnapshot(
+          messageID: 9002,
+          runID: 'run-snapshot-test',
+          authoritySequence: 40,
+          state: 'running',
+        ),
+      ),
+      isFalse,
+    );
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'run-snapshot-test',
+          authoritySequence: 40,
+          state: 'running',
+        ),
       ),
       isTrue,
     );
@@ -318,7 +342,7 @@ void main() {
     manager.setGapListener(null);
   });
 
-  test('ordinary delta with the same gap is rejected', () {
+  test('a delta gap resumes only from a covering Platform snapshot', () {
     final manager = WKEventManager.shared;
     manager.reset();
     final received = <EventPacket>[];
@@ -340,7 +364,86 @@ void main() {
     expect(gaps, hasLength(1));
     expect(gaps.single.expectedMsgEventSequence, 4);
     expect(gaps.single.receivedMsgEventSequence, 6);
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'run-delta-gap-test',
+          authoritySequence: 6,
+          state: 'running',
+        ),
+      ),
+      isTrue,
+    );
     manager.removeListener('delta-gap-test');
+    manager.setGapListener(null);
+  });
+
+  test('terminal state comes only from the applied recovery snapshot', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    final gaps = <WKEventGap>[];
+    manager.addListener('terminal-gap-test', received.add);
+    manager.setGapListener(gaps.add);
+    manager.restoreRunTransportWatermark(9001, 'run-terminal-gap', 3);
+    manager.handle(
+      _event(
+        id: 'evt-finish-gap',
+        type: 'finish',
+        sequence: 6,
+        authoritySequence: 40,
+        runID: 'run-terminal-gap',
+        snapshotState: 'succeeded',
+      ),
+    );
+
+    expect(gaps, hasLength(1));
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'run-terminal-gap',
+          authoritySequence: 40,
+          state: 'succeeded',
+        ),
+      ),
+      isTrue,
+    );
+    manager.handle(
+      _event(
+        id: 'evt-after-recovered-finish',
+        type: 'delta',
+        sequence: 7,
+        runID: 'run-terminal-gap',
+      ),
+    );
+
+    expect(received, isEmpty);
+    manager.removeListener('terminal-gap-test');
+    manager.setGapListener(null);
+  });
+
+  test('first sequence after reset remains a gap when it is greater than one',
+      () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    final gaps = <WKEventGap>[];
+    manager.addListener('reset-gap-test', received.add);
+    manager.setGapListener(gaps.add);
+
+    manager.handle(
+      _event(id: 'evt-after-reset', type: 'delta', sequence: 2),
+    );
+
+    expect(received, isEmpty);
+    expect(gaps, hasLength(1));
+    expect(gaps.single.expectedMsgEventSequence, 1);
+    expect(gaps.single.receivedMsgEventSequence, 2);
+    manager.removeListener('reset-gap-test');
     manager.setGapListener(null);
   });
 
@@ -451,6 +554,7 @@ EventPacket _event({
   String runID = 'run-42',
   String eventKey = 'main',
   int? authoritySequence,
+  String snapshotState = 'running',
 }) =>
     EventPacket()
       ..eventID = id
@@ -470,7 +574,7 @@ EventPacket _event({
                 }
               : {
                   'authority_sequence': authoritySequence ?? sequence,
-                  'snapshot': {'state': 'running', 'text': 'hello'},
+                  'snapshot': {'state': snapshotState, 'text': 'hello'},
                 },
         }),
       );

@@ -130,7 +130,7 @@ void main() {
   });
 
   test('protocol v6 fails closed without exact session identity', () async {
-    WKIM.shared.options.appInstanceID = null;
+    WKIM.shared.options.installationID = null;
 
     WKIM.shared.connectionManager.connect();
     await Future<void>.delayed(const Duration(milliseconds: 100));
@@ -138,7 +138,21 @@ void main() {
     expect(clients, isEmpty);
   });
 
+  test('protocol v6 setup rejects a missing installation identity', () async {
+    final previous = WKIM.shared.options;
+    final accepted = await WKIM.shared.setup(
+      Options.newDefault('setup-user', 'setup-token', addr: previous.addr)
+        ..appInstanceID = 'setup-app-instance'
+        ..installationGeneration = 1
+        ..sessionGeneration = 1,
+    );
+
+    expect(accepted, isFalse);
+    expect(identical(WKIM.shared.options, previous), isTrue);
+  });
+
   test('old delayed handshake does not write after disconnect', () async {
+    WKIM.shared.options.protoVersion = 5;
     WKIM.shared.options.installationID = null;
     holdPreferences = Completer<void>();
     preferencesRequested = Completer<void>();

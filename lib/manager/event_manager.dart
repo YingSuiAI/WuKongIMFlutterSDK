@@ -18,6 +18,26 @@ class WKEventGap {
   );
 }
 
+/// One Platform compact snapshot that has already been durably materialized by
+/// the Client. Transport recovery may advance only when this snapshot covers
+/// the authoritative event carried by a [WKEventGap].
+class WKEventRecoverySnapshot {
+  final int messageID;
+  final String runID;
+  final int authoritySequence;
+  final String state;
+  final bool terminal;
+
+  WKEventRecoverySnapshot({
+    required this.messageID,
+    required String runID,
+    required this.authoritySequence,
+    required String state,
+  })  : runID = runID.trim(),
+        state = state.trim(),
+        terminal = _terminalSnapshotStates.contains(state.trim());
+}
+
 class _WKEventEnvelope {
   final int messageID;
   final String runID;
@@ -85,30 +105,27 @@ class WKEventManager {
   /// authoritative event carried by [gap]. Platform authority sequence and
   /// WuKongIM msg_event_seq are deliberately compared and stored separately.
   bool completeGapRecovery(
-    WKEventGap gap, {
-    required int missingEventAuthoritySequence,
-    required int snapshotAuthoritySequence,
-    bool terminal = false,
-  }) {
-    if (missingEventAuthoritySequence <= 0 ||
-        snapshotAuthoritySequence < missingEventAuthoritySequence) {
-      return false;
-    }
+    WKEventGap gap,
+    WKEventRecoverySnapshot snapshot,
+  ) {
     final envelope = _decodeEnvelope(gap.event);
     if (envelope == null ||
         envelope.messageID != gap.messageID ||
         envelope.runID != gap.runID ||
         envelope.sequence != gap.receivedMsgEventSequence ||
-        envelope.authoritySequence != missingEventAuthoritySequence ||
         gap.expectedMsgEventSequence <= 0 ||
-        gap.expectedMsgEventSequence >= gap.receivedMsgEventSequence) {
+        gap.expectedMsgEventSequence >= gap.receivedMsgEventSequence ||
+        snapshot.messageID != gap.messageID ||
+        snapshot.runID != gap.runID ||
+        snapshot.authoritySequence < envelope.authoritySequence ||
+        !_snapshotStates.contains(snapshot.state)) {
       return false;
     }
     return restoreRunTransportWatermark(
       gap.messageID,
       gap.runID,
       gap.receivedMsgEventSequence,
-      terminal: terminal,
+      terminal: snapshot.terminal,
     );
   }
 
@@ -202,3 +219,17 @@ class WKEventManager {
     'finish',
   };
 }
+
+const Set<String> _terminalSnapshotStates = {
+  'succeeded',
+  'failed',
+  'cancelled',
+  'timed_out',
+};
+
+const Set<String> _snapshotStates = {
+  'queued',
+  'running',
+  'waiting_approval',
+  ..._terminalSnapshotStates,
+};

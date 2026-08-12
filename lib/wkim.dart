@@ -27,6 +27,9 @@ class WKIM {
   Options options = Options();
 
   Future<bool> setup(Options opts) async {
+    if (opts.protoVersion >= 6 && !opts.hasExactV6SessionIdentity) {
+      return false;
+    }
     options = opts;
     deviceFlagApp = opts.deviceFlag;
     eventManager.reset();

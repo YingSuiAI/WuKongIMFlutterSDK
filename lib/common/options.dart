@@ -16,4 +16,12 @@ class Options {
   Options();
 
   Options.newDefault(this.uid, this.token, {this.addr});
+
+  bool get hasExactV6SessionIdentity =>
+      installationID != null &&
+      installationID!.trim().isNotEmpty &&
+      appInstanceID != null &&
+      appInstanceID!.trim().isNotEmpty &&
+      installationGeneration > 0 &&
+      sessionGeneration > 0;
 }

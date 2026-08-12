@@ -173,12 +173,9 @@ class WKConnectionManager {
       return;
     }
     if (WKIM.shared.options.protoVersion >= 6 &&
-        (WKIM.shared.options.appInstanceID == null ||
-            WKIM.shared.options.appInstanceID!.trim().isEmpty ||
-            WKIM.shared.options.installationGeneration <= 0 ||
-            WKIM.shared.options.sessionGeneration <= 0)) {
+        !WKIM.shared.options.hasExactV6SessionIdentity) {
       Logs.error(
-        "WKProto v6 requires appInstanceID and positive installation/session generations",
+        "WKProto v6 requires installationID, appInstanceID, and positive installation/session generations",
       );
       return;
     }
@@ -520,6 +517,10 @@ class WKConnectionManager {
       CryptoUtils.init();
       var deviceID = WKIM.shared.options.installationID;
       if (deviceID == null || deviceID.isEmpty) {
+        if (WKIM.shared.options.protoVersion >= 6) {
+          Logs.error("WKProto v6 requires an exact installationID");
+          return;
+        }
         deviceID = await _getDeviceID();
       }
       if (!_isCurrentSocket(generation, connectedSocket)) {
