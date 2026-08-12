@@ -1,3 +1,9 @@
+### 1.8.0-dirextalk.1
+ * breaking: adopt WKProto v6 uint64 message sequences and remove legacy stream fields
+ * feat: decode typed EVENT frames with deduplication, gap notification, terminal monotonicity, and snapshot recovery
+ * feat: allow callers to provide the Platform installation ID as the WuKong connection identity
+ * fix: decode the optional SENDACK client message number suffix and ignore unknown frame types safely
+
 ### 1.0.0
  * first commint
 ### 1.0.1

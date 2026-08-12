@@ -17,6 +17,7 @@ import 'package:wukongimfluttersdk/wkim.dart';
 import 'package:wukongimfluttersdk/common/crypto_utils.dart';
 import '../common/logs.dart';
 import '../entity/conversation.dart';
+import 'event_manager.dart';
 import '../proto/packet.dart';
 import '../proto/proto.dart';
 import '../type/const.dart';
@@ -136,6 +137,18 @@ class WKConnectionManager {
     if (_connectionListenerMap != null) {
       _connectionListenerMap!.remove(key);
     }
+  }
+
+  void addOnEventListener(String key, void Function(EventPacket) listener) {
+    WKEventManager.shared.addListener(key, listener);
+  }
+
+  void removeOnEventListener(String key) {
+    WKEventManager.shared.removeListener(key);
+  }
+
+  void setOnEventGapListener(void Function(WKEventGap)? listener) {
+    WKEventManager.shared.setGapListener(listener);
   }
 
   setConnectionStatus(int status, {int? reasoncode, ConnectionInfo? info}) {
@@ -325,13 +338,13 @@ class WKConnectionManager {
       ReadData readData = ReadData(lastMsgBytes);
       var b = readData.readUint8();
       var packetType = b >> 4;
-      if (PacketType.values[(b >> 4)] == PacketType.pong) {
+      if (packetType == PacketType.pong.index) {
         Logs.debug('pong');
         unReceivePongCount = 0;
         Uint8List bytes = lastMsgBytes.sublist(1, lastMsgBytes.length);
         _cacheData = lastMsgBytes = bytes;
       } else {
-        if (packetType < 10) {
+        if (packetType <= 0x0f) {
           if (lastMsgBytes.length < 5) {
             _cacheData = lastMsgBytes;
             break;
@@ -446,6 +459,8 @@ class WKConnectionManager {
       if (_sendingMsgMap.containsKey(sendack.clientSeq)) {
         _sendingMsgMap[sendack.clientSeq]!.isCanResend = false;
       }
+    } else if (packet.header.packetType == PacketType.event) {
+      WKEventManager.shared.handle(packet as EventPacket);
     } else if (packet.header.packetType == PacketType.disconnect) {
       disconnect(true);
       if (!_isCurrentSocket(generation, connectedSocket)) {
@@ -493,7 +508,10 @@ class WKConnectionManager {
       int generation, _WKSocket connectedSocket) async {
     try {
       CryptoUtils.init();
-      var deviceID = await _getDeviceID();
+      var deviceID = WKIM.shared.options.installationID;
+      if (deviceID == null || deviceID.isEmpty) {
+        deviceID = await _getDeviceID();
+      }
       if (!_isCurrentSocket(generation, connectedSocket)) {
         return;
       }

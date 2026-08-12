@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:wukongimfluttersdk/common/crypto_utils.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
 
@@ -5,6 +7,7 @@ import 'proto.dart';
 
 class PacketHeader {
   PacketType packetType = PacketType.reserved; // 数据包类型
+  int packetTypeValue = PacketType.reserved.index;
   bool showUnread = false; // 是否显示未读红点
   bool noPersist = false; // 是否不存储
   bool syncOnce = false; // 是否只同步一次
@@ -59,7 +62,6 @@ class SendPacket extends Packet {
   Setting setting = Setting();
   int clientSeq;
   String clientMsgNO;
-  String streamNo = "";
   String channelID;
   int channelType;
   String? topic;
@@ -95,6 +97,7 @@ class SendPacket extends Packet {
 class SendAckPacket extends Packet {
   String messageID = "";
   int clientSeq = 0;
+  String clientMsgNO = "";
   int messageSeq = 0;
   int reasonCode = 0;
   SendAckPacket() {
@@ -119,9 +122,6 @@ class RecvPacket extends Packet {
   String channelID = "";
   int channelType = 0;
   String clientMsgNO = "";
-  String streamNo = "";
-  int streamSeq = 0;
-  int streamFlag = 0;
   BigInt messageID = BigInt.from(0);
   int messageSeq = 0;
   int messageTime = 0;
@@ -131,6 +131,35 @@ class RecvPacket extends Packet {
   @override
   String toString() {
     return "msgkey：$msgKey，chanenlID：$channelID，channelType：$channelType，fromUID：$fromUID，clientMsgNO：$clientMsgNO，messageID：$messageID，messageSeq：$messageSeq，messageTime：$messageTime，payload：$payload";
+  }
+}
+
+class EventPacket extends Packet {
+  String eventID = "";
+  String eventType = "";
+  int timestamp = 0;
+  List<int> data = const [];
+
+  Map<String, dynamic>? decodeJsonData() {
+    try {
+      final value = jsonDecode(utf8.decode(data));
+      return value is Map<String, dynamic> ? value : null;
+    } on FormatException {
+      return null;
+    }
+  }
+
+  EventPacket() {
+    header.packetType = PacketType.event;
+    header.packetTypeValue = PacketType.event.index;
+  }
+}
+
+class UnknownPacket extends Packet {
+  final List<int> data;
+
+  UnknownPacket(PacketHeader packetHeader, this.data) {
+    header = packetHeader;
   }
 }
 

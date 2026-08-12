@@ -6,6 +6,8 @@ class ReadData {
   ByteData? _byteData;
   int offset = 0;
 
+  int get remainingLength => _data.length - offset;
+
   ReadData(this._data) {
     _byteData = ByteData.view(_data.buffer);
   }

@@ -18,21 +18,23 @@ enum PacketType {
   ping,
   pong,
   disconnect,
+  sub,
+  suback,
+  event,
+  unknown,
 }
 
 class Setting {
   int receipt = 0;
   int topic = 0;
-  int stream = 0;
   Setting decode(int v) {
     receipt = (v >> 7 & 0x01);
     topic = (v >> 3 & 0x01);
-    stream = (v >> 2 & 0x001);
     return this;
   }
 
   int encode() {
-    return receipt << 7 | topic << 3 | stream << 2;
+    return receipt << 7 | topic << 3;
   }
 }
 
@@ -46,7 +48,8 @@ class Proto {
     PacketType.connack: decodeConnack,
     PacketType.recv: decodeRecv,
     PacketType.sendack: decodeSendAck,
-    PacketType.disconnect: decodeDisconnect
+    PacketType.disconnect: decodeDisconnect,
+    PacketType.event: decodeEvent,
   };
 
   Uint8List encode(Packet packet) {
@@ -76,7 +79,7 @@ class Proto {
     }
     var packetDecodeFunc = packetDecodeMap[header.packetType];
     if (packetDecodeFunc == null) {
-      Logs.error("不支持的协议包->${header.packetType}");
+      return UnknownPacket(header, reader.readRemaining());
     }
     return packetDecodeFunc(header, reader);
   }
@@ -119,7 +122,8 @@ PacketHeader decodeHeader(ReadData reader) {
   header.noPersist = (b & 0x01) > 0;
   header.showUnread = ((b >> 1) & 0x01) > 0;
   header.syncOnce = ((b >> 2) & 0x01) > 0;
-  header.packetType = PacketType.values[(b >> 4)];
+  header.packetTypeValue = b >> 4;
+  header.packetType = packetTypeFromValue(header.packetTypeValue);
   if (header.packetType != PacketType.ping &&
       header.packetType != PacketType.pong) {
     header.remainingLength = reader.readVariableLength();
@@ -128,6 +132,13 @@ PacketHeader decodeHeader(ReadData reader) {
     header.hasServerVersion = (b & 0x01) > 0;
   }
   return header;
+}
+
+PacketType packetTypeFromValue(int value) {
+  if (value >= PacketType.reserved.index && value <= PacketType.event.index) {
+    return PacketType.values[value];
+  }
+  return PacketType.unknown;
 }
 
 encodeHeader(Packet packet, int remainingLength) {
@@ -171,9 +182,6 @@ Uint8List encodeSend(SendPacket packet) {
   write.writeUint8(packet.setting.encode());
   write.writeUint32(packet.clientSeq);
   write.writeString(packet.clientMsgNO);
-  if (packet.setting.stream == 1) {
-    write.writeString(packet.streamNo);
-  }
   write.writeString(packet.channelID);
   write.writeUint8(packet.channelType);
   if (WKIM.shared.options.protoVersion >= 3) {
@@ -190,7 +198,11 @@ Uint8List encodeSend(SendPacket packet) {
 Uint8List encodeRecvAck(RecvAckPacket packet) {
   WriteData write = WriteData();
   write.writeUint64(packet.messageID);
-  write.writeUint32(packet.messageSeq);
+  if (WKIM.shared.options.protoVersion >= 6) {
+    write.writeUint64(BigInt.from(packet.messageSeq));
+  } else {
+    write.writeUint32(packet.messageSeq);
+  }
   return write.toUint8List();
 }
 
@@ -198,8 +210,13 @@ SendAckPacket decodeSendAck(PacketHeader header, ReadData reader) {
   var sendack = SendAckPacket();
   sendack.messageID = reader.readUint64().toString();
   sendack.clientSeq = reader.readUint32();
-  sendack.messageSeq = reader.readUint32();
+  sendack.messageSeq = WKIM.shared.options.protoVersion >= 6
+      ? reader.readUint64().toInt()
+      : reader.readUint32();
   sendack.reasonCode = reader.readUint8();
+  if (reader.remainingLength > 0) {
+    sendack.clientMsgNO = reader.readString();
+  }
   return sendack;
 }
 
@@ -216,13 +233,10 @@ RecvPacket decodeRecv(PacketHeader header, ReadData reader) {
     recv.expire = reader.readUint32().toInt();
   }
   recv.clientMsgNO = reader.readString();
-  if (recv.setting.stream == 1) {
-    recv.streamNo = reader.readString();
-    recv.streamSeq = reader.readUint32().toInt();
-    recv.streamFlag = reader.readByte();
-  }
   recv.messageID = reader.readUint64();
-  recv.messageSeq = reader.readUint32().toInt();
+  recv.messageSeq = WKIM.shared.options.protoVersion >= 6
+      ? reader.readUint64().toInt()
+      : reader.readUint32().toInt();
   recv.messageTime = reader.readUint32().toInt();
   if (recv.setting.topic == 1) {
     recv.topic = reader.readString();
@@ -230,6 +244,16 @@ RecvPacket decodeRecv(PacketHeader header, ReadData reader) {
   var payload = reader.readRemaining();
   recv.payload = String.fromCharCodes(payload);
   return recv;
+}
+
+EventPacket decodeEvent(PacketHeader header, ReadData reader) {
+  var event = EventPacket();
+  event.header = header;
+  event.eventID = reader.readString();
+  event.eventType = reader.readString();
+  event.timestamp = reader.readUint64().toInt();
+  event.data = reader.readRemaining();
+  return event;
 }
 
 DisconnectPacket decodeDisconnect(PacketHeader header, ReadData reader) {
