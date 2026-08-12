@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -7,6 +8,7 @@ import 'package:wukongimfluttersdk/manager/connect_manager.dart';
 import 'package:wukongimfluttersdk/manager/event_manager.dart';
 import 'package:wukongimfluttersdk/proto/packet.dart';
 import 'package:wukongimfluttersdk/proto/proto.dart';
+import 'package:wukongimfluttersdk/proto/write_read.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
 
 void main() {
@@ -16,7 +18,8 @@ void main() {
 
   test('decodes the Go EVENT golden frame', () {
     final frame = Uint8List.fromList(
-        HEX.decode('c01a000631323334353600047465737400000000499602d274657374'));
+      HEX.decode('c01a000631323334353600047465737400000000499602d274657374'),
+    );
 
     final packet = Proto().decode(frame) as EventPacket;
 
@@ -38,9 +41,64 @@ void main() {
     expect(HEX.encode(encoded.sublist(10)), '0000000100000001');
   });
 
+  test('encodes both installation and session generations in v6 CONNECT', () {
+    final packet = ConnectPacket(
+      version: 6,
+      deviceFlag: 1,
+      deviceID: 'install-1',
+      uid: 'u1',
+      token: 'token-1',
+      clientTimestamp: 1786521600000,
+      clientKey: 'client-key',
+      appInstanceID: 'app-1',
+      installationGeneration: 3,
+      sessionGeneration: 7,
+    );
+
+    final encoded = Proto().encode(packet);
+    final reader = ReadData(encoded);
+    expect(reader.readUint8() >> 4, PacketType.connect.index);
+    expect(reader.readVariableLength(), reader.remainingLength);
+    expect(reader.readUint8(), 6);
+    expect(reader.readUint8(), 1);
+    expect(reader.readString(), 'install-1');
+    expect(reader.readString(), 'u1');
+    expect(reader.readString(), 'token-1');
+    expect(reader.readUint64(), BigInt.from(1786521600000));
+    expect(reader.readString(), 'client-key');
+    expect(reader.readString(), 'app-1');
+    expect(reader.readUint64(), BigInt.from(3));
+    expect(reader.readUint64(), BigInt.from(7));
+
+    expect(reader.remainingLength, 0);
+  });
+
+  test('pre-v6 CONNECT does not append v6 session identity fields', () {
+    final packet = ConnectPacket(
+      version: 5,
+      deviceID: 'legacy-device',
+      uid: 'legacy-user',
+      token: 'legacy-token',
+      clientTimestamp: 1,
+      clientKey: 'legacy-key',
+      appInstanceID: 'must-not-be-encoded',
+      installationGeneration: 8,
+      sessionGeneration: 9,
+    );
+
+    final encoded = Proto().encode(packet);
+    final bodyLength = encoded.length - 2;
+    const expectedBodyLength = 1 + 1 + 2 + 13 + 2 + 11 + 2 + 12 + 8 + 2 + 10;
+
+    expect(bodyLength, expectedBodyLength);
+  });
+
   test('decodes the optional SENDACK client message number suffix', () {
-    final frame = Uint8List.fromList(HEX.decode(
-        '40200000000000000001000000020000000100000003010009636c69656e742d3432'));
+    final frame = Uint8List.fromList(
+      HEX.decode(
+        '40200000000000000001000000020000000100000003010009636c69656e742d3432',
+      ),
+    );
 
     final packet = Proto().decode(frame) as SendAckPacket;
 
@@ -64,8 +122,12 @@ void main() {
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
     manager.addOnEventListener('proto-v6-test', received.add);
-    final frame = Uint8List.fromList(
-        HEX.decode('c01a000631323334353600047465737400000000499602d274657374'));
+    final event = _event(
+      id: 'evt-connection',
+      type: 'open',
+      sequence: 1,
+    );
+    final frame = _encodeEventFrame(event);
 
     manager.testCutData(Uint8List.fromList([...frame, ...frame]));
 
@@ -78,8 +140,9 @@ void main() {
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
     manager.addOnEventListener('unknown-frame-test', received.add);
-    final event =
-        HEX.decode('c01a000631323334353600047465737400000000499602d274657374');
+    final event = _encodeEventFrame(
+      _event(id: 'evt-unknown-followup', type: 'open', sequence: 1),
+    );
 
     manager.testCutData(Uint8List.fromList([0xf0, 0x01, 0x2a, ...event]));
 
@@ -92,12 +155,10 @@ void main() {
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
     manager.addOnEventListener('split-header-test', received.add);
-    final frame = Uint8List.fromList([
-      0xc0,
-      0x80 | 26,
-      0x00,
-      ...HEX.decode('000631323334353600047465737400000000499602d274657374'),
-    ]);
+    final event = _event(id: 'evt-split', type: 'open', sequence: 1);
+    final body = _eventBody(event);
+    final encodedLength = _encodeVariableLength(body.length, padded: true);
+    final frame = Uint8List.fromList([0xc0, ...encodedLength, ...body]);
 
     manager.testCutData(frame.sublist(0, 2));
     expect(received, isEmpty);
@@ -107,52 +168,452 @@ void main() {
     manager.removeOnEventListener('split-header-test');
   });
 
-  test('event manager reports a sequence gap and ignores late terminal data',
+  test('message event sequence stays continuous across interleaved lanes', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    final gaps = <WKEventGap>[];
+    manager.addListener('interleaved-lanes-test', received.add);
+    manager.setGapListener(gaps.add);
+
+    EventPacket event(String id, String key, int sequence) => EventPacket()
+      ..eventID = id
+      ..eventType = 'delta'
+      ..data = utf8.encode(
+        jsonEncode({
+          'message_id': 9001,
+          'run_id': 'run-interleaved',
+          'event_type': 'delta',
+          'event_key': key,
+          'msg_event_seq': sequence,
+          'payload': {
+            'authority_sequence': sequence,
+            'text_delta': 'hello',
+          },
+        }),
+      );
+
+    manager.handle(event('evt-answer-1', 'answer', 1));
+    manager.handle(event('evt-tool-2', 'tool', 2));
+    manager.handle(event('evt-answer-3', 'answer', 3));
+
+    expect(received, hasLength(3));
+    expect(gaps, isEmpty);
+    manager.removeListener('interleaved-lanes-test');
+    manager.setGapListener(null);
+  });
+
+  test('event manager reads metadata only from the top-level envelope', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    manager.addListener('payload-metadata-test', received.add);
+    final event = EventPacket()
+      ..eventID = 'evt-nested-only'
+      ..eventType = 'delta'
+      ..data = utf8.encode(
+        jsonEncode({
+          'payload': {
+            'run_id': 'run-nested',
+            'event_type': 'delta',
+            'event_key': 'main',
+            'msg_event_seq': 1,
+          },
+        }),
+      );
+
+    manager.handle(event);
+
+    expect(received, isEmpty);
+    manager.removeListener('payload-metadata-test');
+  });
+
+  test('event manager requires frame type to equal envelope event_type', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    manager.addListener('type-mismatch-test', received.add);
+    final event = _event(id: 'evt-type-mismatch', type: 'delta', sequence: 1)
+      ..eventType = 'snapshot';
+
+    manager.handle(event);
+
+    expect(received, isEmpty);
+    manager.removeListener('type-mismatch-test');
+  });
+
+  test('event manager rejects an empty event key', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    manager.addListener('prefixed-key-test', received.add);
+    final event = _event(
+      id: 'evt-empty-key',
+      type: 'delta',
+      sequence: 1,
+      eventKey: '',
+    );
+
+    manager.handle(event);
+
+    expect(received, isEmpty);
+    manager.removeListener('prefixed-key-test');
+  });
+
+  test('event manager resumes only after Platform snapshot covers a gap', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    final gaps = <WKEventGap>[];
+    manager.addListener('snapshot-test', received.add);
+    manager.setGapListener(gaps.add);
+    final event = _event(
+      id: 'snapshot-followup',
+      type: 'snapshot',
+      sequence: 6,
+      authoritySequence: 40,
+      runID: 'run-snapshot-test',
+    );
+    manager.restoreRunTransportWatermark(9001, 'run-snapshot-test', 3);
+
+    manager.handle(event);
+
+    expect(received, isEmpty);
+    expect(gaps, hasLength(1));
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'run-snapshot-test',
+          authoritySequence: 39,
+          state: 'running',
+        ),
+      ),
+      isFalse,
+    );
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'another-run',
+          authoritySequence: 40,
+          state: 'running',
+        ),
+      ),
+      isFalse,
+    );
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9002,
+          runID: 'run-snapshot-test',
+          authoritySequence: 40,
+          state: 'running',
+        ),
+      ),
+      isFalse,
+    );
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'run-snapshot-test',
+          authoritySequence: 40,
+          state: 'running',
+        ),
+      ),
+      isTrue,
+    );
+    final next = _event(
+      id: 'event-after-snapshot-recovery',
+      type: 'delta',
+      sequence: 7,
+      runID: 'run-snapshot-test',
+    );
+
+    manager.handle(next);
+
+    expect(received, [next]);
+    manager.removeListener('snapshot-test');
+    manager.setGapListener(null);
+  });
+
+  test('a delta gap resumes only from a covering Platform snapshot', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    final gaps = <WKEventGap>[];
+    manager.addListener('delta-gap-test', received.add);
+    manager.setGapListener(gaps.add);
+    manager.restoreRunTransportWatermark(9001, 'run-delta-gap-test', 3);
+
+    manager.handle(
+      _event(
+        id: 'evt-delta-gap',
+        type: 'delta',
+        sequence: 6,
+        runID: 'run-delta-gap-test',
+      ),
+    );
+
+    expect(received, isEmpty);
+    expect(gaps, hasLength(1));
+    expect(gaps.single.expectedMsgEventSequence, 4);
+    expect(gaps.single.receivedMsgEventSequence, 6);
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'run-delta-gap-test',
+          authoritySequence: 6,
+          state: 'running',
+        ),
+      ),
+      isTrue,
+    );
+    manager.removeListener('delta-gap-test');
+    manager.setGapListener(null);
+  });
+
+  test('terminal state comes only from the applied recovery snapshot', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    final gaps = <WKEventGap>[];
+    manager.addListener('terminal-gap-test', received.add);
+    manager.setGapListener(gaps.add);
+    manager.restoreRunTransportWatermark(9001, 'run-terminal-gap', 3);
+    manager.handle(
+      _event(
+        id: 'evt-finish-gap',
+        type: 'finish',
+        sequence: 6,
+        authoritySequence: 40,
+        runID: 'run-terminal-gap',
+        snapshotState: 'succeeded',
+      ),
+    );
+
+    expect(gaps, hasLength(1));
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        WKEventRecoverySnapshot(
+          messageID: 9001,
+          runID: 'run-terminal-gap',
+          authoritySequence: 40,
+          state: 'succeeded',
+        ),
+      ),
+      isTrue,
+    );
+    manager.handle(
+      _event(
+        id: 'evt-after-recovered-finish',
+        type: 'delta',
+        sequence: 7,
+        runID: 'run-terminal-gap',
+      ),
+    );
+
+    expect(received, isEmpty);
+    manager.removeListener('terminal-gap-test');
+    manager.setGapListener(null);
+  });
+
+  test('first sequence after reset remains a gap when it is greater than one',
       () {
     final manager = WKEventManager.shared;
     manager.reset();
     final received = <EventPacket>[];
     final gaps = <WKEventGap>[];
-    manager.addListener('reducer-test', received.add);
+    manager.addListener('reset-gap-test', received.add);
     manager.setGapListener(gaps.add);
 
-    EventPacket event(String id, int sequence, String type) => EventPacket()
-      ..eventID = id
-      ..eventType = 'agent.run.event'
-      ..data =
-          '''{"payload":{"run_id":"run-reducer-test","event_key":"main","event_type":"$type","authority_sequence":$sequence}}'''
-              .codeUnits;
+    manager.handle(
+      _event(id: 'evt-after-reset', type: 'delta', sequence: 2),
+    );
 
-    manager.handle(event('event-1', 1, 'delta'));
-    manager.handle(event('event-3', 3, 'delta'));
-    manager.handle(event('event-2', 2, 'finish'));
-    manager.handle(event('event-4', 3, 'delta'));
-
-    expect(received, hasLength(2));
+    expect(received, isEmpty);
     expect(gaps, hasLength(1));
-    expect(gaps.single.expectedSequence, 2);
-    expect(gaps.single.receivedSequence, 3);
-    expect(gaps.single.event.eventID, 'event-3');
-    manager.removeListener('reducer-test');
+    expect(gaps.single.expectedMsgEventSequence, 1);
+    expect(gaps.single.receivedMsgEventSequence, 2);
+    manager.removeListener('reset-gap-test');
     manager.setGapListener(null);
   });
 
-  test('event manager resumes after applying a compact snapshot', () {
+  test('finish terminates every lane in the run', () {
     final manager = WKEventManager.shared;
     manager.reset();
     final received = <EventPacket>[];
-    manager.addListener('snapshot-test', received.add);
+    manager.addListener('run-finish-test', received.add);
+    final finish = _event(
+      id: 'evt-finish',
+      type: 'finish',
+      sequence: 7,
+    );
+    manager.restoreRunTransportWatermark(9001, 'run-42', 6);
+    manager.handle(finish);
 
-    final event = EventPacket()
-      ..eventID = 'snapshot-followup'
-      ..eventType = 'agent.run.event'
-      ..data =
-          '''{"payload":{"run_id":"run-snapshot-test","event_key":"main","event_type":"delta","authority_sequence":4}}'''
-              .codeUnits;
-    manager.recoverStream('run-snapshot-test', 'main', 3);
-    manager.handle(event);
+    manager.handle(
+      _event(
+        id: 'evt-after-finish',
+        type: 'delta',
+        sequence: 8,
+        eventKey: 'tool',
+      ),
+    );
 
-    expect(received, [event]);
-    manager.removeListener('snapshot-test');
+    expect(received, [finish]);
+    manager.removeListener('run-finish-test');
   });
+
+  test('same run ID on another message has an independent watermark', () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    manager.addListener('anchor-isolation-test', received.add);
+    final first = _event(id: 'evt-1', type: 'open', sequence: 1);
+    final second = _event(
+      id: 'evt-1',
+      type: 'open',
+      sequence: 1,
+      messageID: 9002,
+    );
+
+    manager.handle(first);
+    manager.handle(second);
+
+    expect(received, [first, second]);
+    manager.removeListener('anchor-isolation-test');
+  });
+
+  test('transport recovery never uses or stores Platform authority sequence',
+      () {
+    final manager = WKEventManager.shared;
+    manager.reset();
+    final received = <EventPacket>[];
+    manager.addListener('recover-monotonic-test', received.add);
+    expect(
+      manager.restoreRunTransportWatermark(
+        9001,
+        'run-recover-monotonic',
+        5,
+      ),
+      isTrue,
+    );
+    expect(
+      manager.restoreRunTransportWatermark(
+        9001,
+        'run-recover-monotonic',
+        3,
+      ),
+      isFalse,
+    );
+    manager.handle(
+      _event(
+        id: 'evt-stale-after-recovery',
+        type: 'delta',
+        sequence: 4,
+        runID: 'run-recover-monotonic',
+      ),
+    );
+    expect(
+      manager.restoreRunTransportWatermark(
+        9001,
+        'run-recover-monotonic',
+        6,
+        terminal: true,
+      ),
+      isTrue,
+    );
+    manager.handle(
+      _event(
+        id: 'evt-after-terminal-recovery',
+        type: 'delta',
+        sequence: 7,
+        runID: 'run-recover-monotonic',
+      ),
+    );
+
+    expect(received, isEmpty);
+    manager.removeListener('recover-monotonic-test');
+  });
+}
+
+EventPacket _event({
+  required String id,
+  required String type,
+  required int sequence,
+  int messageID = 9001,
+  String runID = 'run-42',
+  String eventKey = 'main',
+  int? authoritySequence,
+  String snapshotState = 'running',
+}) =>
+    EventPacket()
+      ..eventID = id
+      ..eventType = type
+      ..timestamp = 1786521600000
+      ..data = utf8.encode(
+        jsonEncode({
+          'message_id': messageID,
+          'run_id': runID,
+          'event_type': type,
+          'event_key': eventKey,
+          'msg_event_seq': sequence,
+          'payload': type == 'delta'
+              ? {
+                  'authority_sequence': authoritySequence ?? sequence,
+                  'text_delta': 'hello',
+                }
+              : {
+                  'authority_sequence': authoritySequence ?? sequence,
+                  'snapshot': {'state': snapshotState, 'text': 'hello'},
+                },
+        }),
+      );
+
+Uint8List _encodeEventFrame(EventPacket event) {
+  final body = _eventBody(event);
+  return Uint8List.fromList([
+    0xc0,
+    ..._encodeVariableLength(body.length),
+    ...body,
+  ]);
+}
+
+List<int> _eventBody(EventPacket event) {
+  final eventID = utf8.encode(event.eventID);
+  final eventType = utf8.encode(event.eventType);
+  final timestamp = BigInt.from(event.timestamp);
+  final bytes = <int>[
+    eventID.length >> 8,
+    eventID.length & 0xff,
+    ...eventID,
+    eventType.length >> 8,
+    eventType.length & 0xff,
+    ...eventType,
+  ];
+  for (var shift = 56; shift >= 0; shift -= 8) {
+    bytes.add(((timestamp >> shift) & BigInt.from(0xff)).toInt());
+  }
+  return [...bytes, ...event.data];
+}
+
+List<int> _encodeVariableLength(int value, {bool padded = false}) {
+  final bytes = <int>[];
+  do {
+    var digit = value % 0x80;
+    value ~/= 0x80;
+    if (value > 0 || (padded && bytes.isEmpty)) digit |= 0x80;
+    bytes.add(digit);
+  } while (value > 0);
+  if (padded && bytes.length == 1) bytes.add(0);
+  return bytes;
 }

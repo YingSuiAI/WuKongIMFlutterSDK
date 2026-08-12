@@ -6,6 +6,9 @@ class Options {
   int protoVersion = 0x06; // protocol version
   int deviceFlag = 0;
   String? installationID;
+  String? appInstanceID;
+  int installationGeneration = 0;
+  int sessionGeneration = 0;
   bool debug = true;
   Function(Function(String addr) complete)?
       getAddr; // async get connect address
@@ -13,4 +16,12 @@ class Options {
   Options();
 
   Options.newDefault(this.uid, this.token, {this.addr});
+
+  bool get hasExactV6SessionIdentity =>
+      installationID != null &&
+      installationID!.trim().isNotEmpty &&
+      appInstanceID != null &&
+      appInstanceID!.trim().isNotEmpty &&
+      installationGeneration > 0 &&
+      sessionGeneration > 0;
 }

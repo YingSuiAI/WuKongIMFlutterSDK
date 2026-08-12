@@ -4,12 +4,58 @@ import '../proto/packet.dart';
 
 class WKEventGap {
   final EventPacket event;
-  final String streamKey;
-  final int expectedSequence;
-  final int receivedSequence;
+  final int messageID;
+  final String runID;
+  final int expectedMsgEventSequence;
+  final int receivedMsgEventSequence;
 
   const WKEventGap(
-      this.event, this.streamKey, this.expectedSequence, this.receivedSequence);
+    this.event,
+    this.messageID,
+    this.runID,
+    this.expectedMsgEventSequence,
+    this.receivedMsgEventSequence,
+  );
+}
+
+/// One Platform compact snapshot that has already been durably materialized by
+/// the Client. Transport recovery may advance only when this snapshot covers
+/// the authoritative event carried by a [WKEventGap].
+class WKEventRecoverySnapshot {
+  final int messageID;
+  final String runID;
+  final int authoritySequence;
+  final String state;
+  final bool terminal;
+
+  WKEventRecoverySnapshot({
+    required this.messageID,
+    required String runID,
+    required this.authoritySequence,
+    required String state,
+  })  : runID = runID.trim(),
+        state = state.trim(),
+        terminal = _terminalSnapshotStates.contains(state.trim());
+}
+
+class _WKEventEnvelope {
+  final int messageID;
+  final String runID;
+  final String eventType;
+  final String eventKey;
+  final int sequence;
+  final int authoritySequence;
+
+  const _WKEventEnvelope(
+    this.messageID,
+    this.runID,
+    this.eventType,
+    this.eventKey,
+    this.sequence,
+    this.authoritySequence,
+  );
+
+  String get watermarkKey => '$messageID:$runID';
 }
 
 class WKEventManager {
@@ -19,8 +65,8 @@ class WKEventManager {
 
   final HashMap<String, void Function(EventPacket)> _listeners = HashMap();
   final LinkedHashSet<String> _recentEventIDs = LinkedHashSet();
-  final HashMap<String, int> _sequences = HashMap();
-  final HashSet<String> _terminalStreams = HashSet();
+  final HashMap<String, int> _runSequences = HashMap();
+  final HashSet<String> _terminalRuns = HashSet();
   void Function(WKEventGap)? _gapListener;
 
   void addListener(String key, void Function(EventPacket) listener) {
@@ -35,57 +81,93 @@ class WKEventManager {
     _gapListener = listener;
   }
 
-  void recoverStream(String runID, String eventKey, int authoritySequence,
-      {bool terminal = false}) {
-    final streamKey = '$runID:$eventKey';
-    _sequences[streamKey] = authoritySequence;
-    if (terminal) {
-      _terminalStreams.add(streamKey);
-    } else {
-      _terminalStreams.remove(streamKey);
+  bool restoreRunTransportWatermark(
+    int messageID,
+    String runID,
+    int msgEventSequence, {
+    bool terminal = false,
+  }) {
+    final normalizedRunID = runID.trim();
+    if (messageID <= 0 || normalizedRunID.isEmpty || msgEventSequence <= 0) {
+      return false;
     }
+    final watermarkKey = '$messageID:$normalizedRunID';
+    final previous = _runSequences[watermarkKey] ?? 0;
+    if (msgEventSequence < previous || _terminalRuns.contains(watermarkKey)) {
+      return false;
+    }
+    _runSequences[watermarkKey] = msgEventSequence;
+    if (terminal) _terminalRuns.add(watermarkKey);
+    return true;
+  }
+
+  /// Completes one transport gap only after a Platform snapshot covers the
+  /// authoritative event carried by [gap]. Platform authority sequence and
+  /// WuKongIM msg_event_seq are deliberately compared and stored separately.
+  bool completeGapRecovery(
+    WKEventGap gap,
+    WKEventRecoverySnapshot snapshot,
+  ) {
+    final envelope = _decodeEnvelope(gap.event);
+    if (envelope == null ||
+        envelope.messageID != gap.messageID ||
+        envelope.runID != gap.runID ||
+        envelope.sequence != gap.receivedMsgEventSequence ||
+        gap.expectedMsgEventSequence <= 0 ||
+        gap.expectedMsgEventSequence >= gap.receivedMsgEventSequence ||
+        snapshot.messageID != gap.messageID ||
+        snapshot.runID != gap.runID ||
+        snapshot.authoritySequence < envelope.authoritySequence ||
+        !_snapshotStates.contains(snapshot.state)) {
+      return false;
+    }
+    return restoreRunTransportWatermark(
+      gap.messageID,
+      gap.runID,
+      gap.receivedMsgEventSequence,
+      terminal: snapshot.terminal,
+    );
   }
 
   void reset() {
     _recentEventIDs.clear();
-    _sequences.clear();
-    _terminalStreams.clear();
+    _runSequences.clear();
+    _terminalRuns.clear();
   }
 
   void handle(EventPacket event) {
-    if (_recentEventIDs.contains(event.eventID)) {
+    final eventID = event.eventID.trim();
+    final envelope = _decodeEnvelope(event);
+    if (envelope == null ||
+        !_supportedEventTypes.contains(envelope.eventType)) {
       return;
     }
-
-    final envelope = event.decodeJsonData();
-    final payload = envelope?['payload'];
-    if (payload is Map<String, dynamic>) {
-      final runID = payload['run_id'];
-      final eventKey = payload['event_key'];
-      final sequence = payload['authority_sequence'];
-      final eventType = payload['event_type'];
-      if (runID is String &&
-          eventKey is String &&
-          sequence is int &&
-          sequence > 0) {
-        final streamKey = '$runID:$eventKey';
-        final lastSequence = _sequences[streamKey] ?? 0;
-        if (_terminalStreams.contains(streamKey) || sequence <= lastSequence) {
-          return;
-        }
-        if (lastSequence > 0 && sequence != lastSequence + 1) {
-          _gapListener
-              ?.call(WKEventGap(event, streamKey, lastSequence + 1, sequence));
-          return;
-        }
-        _sequences[streamKey] = sequence;
-        if (eventType == 'finish') {
-          _terminalStreams.add(streamKey);
-        }
-      }
+    final watermarkKey = envelope.watermarkKey;
+    final deduplicationKey = '$watermarkKey\u0000$eventID';
+    if (eventID.isEmpty || _recentEventIDs.contains(deduplicationKey)) {
+      return;
+    }
+    if (_terminalRuns.contains(watermarkKey)) return;
+    final lastSequence = _runSequences[watermarkKey] ?? 0;
+    if (envelope.sequence <= lastSequence) return;
+    if (envelope.sequence != lastSequence + 1) {
+      _gapListener?.call(
+        WKEventGap(
+          event,
+          envelope.messageID,
+          envelope.runID,
+          lastSequence + 1,
+          envelope.sequence,
+        ),
+      );
+      return;
+    }
+    _runSequences[watermarkKey] = envelope.sequence;
+    if (envelope.eventType == 'finish') {
+      _terminalRuns.add(watermarkKey);
     }
 
-    _recentEventIDs.add(event.eventID);
+    _recentEventIDs.add(deduplicationKey);
     if (_recentEventIDs.length > 4096) {
       _recentEventIDs.remove(_recentEventIDs.first);
     }
@@ -94,4 +176,60 @@ class WKEventManager {
       listener(event);
     }
   }
+
+  static _WKEventEnvelope? _decodeEnvelope(EventPacket event) {
+    final data = event.decodeJsonData();
+    if (data == null) return null;
+    final messageID = data['message_id'];
+    final runID = data['run_id'];
+    final eventType = data['event_type'];
+    final eventKey = data['event_key'];
+    final sequence = data['msg_event_seq'];
+    final payload = data['payload'];
+    final authoritySequence =
+        payload is Map<String, dynamic> ? payload['authority_sequence'] : null;
+    if (messageID is! int ||
+        messageID <= 0 ||
+        runID is! String ||
+        runID.trim().isEmpty ||
+        eventType is! String ||
+        eventType != event.eventType ||
+        eventKey is! String ||
+        eventKey.trim().isEmpty ||
+        sequence is! int ||
+        sequence <= 0 ||
+        authoritySequence is! int ||
+        authoritySequence <= 0) {
+      return null;
+    }
+    return _WKEventEnvelope(
+      messageID,
+      runID.trim(),
+      eventType,
+      eventKey.trim(),
+      sequence,
+      authoritySequence,
+    );
+  }
+
+  static const Set<String> _supportedEventTypes = {
+    'open',
+    'delta',
+    'snapshot',
+    'finish',
+  };
 }
+
+const Set<String> _terminalSnapshotStates = {
+  'succeeded',
+  'failed',
+  'cancelled',
+  'timed_out',
+};
+
+const Set<String> _snapshotStates = {
+  'queued',
+  'running',
+  'waiting_approval',
+  ..._terminalSnapshotStates,
+};

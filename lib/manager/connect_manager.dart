@@ -116,7 +116,7 @@ class WKConnectionManager {
   final int reconnMilliseconds = 1500;
   Timer? heartTimer;
   Timer? checkNetworkTimer;
-  final heartIntervalSecond = const Duration(seconds: 60);
+  final heartIntervalSecond = const Duration(seconds: 30);
   final checkNetworkSecond = const Duration(seconds: 1);
   int unReceivePongCount = 0;
   final LinkedHashMap<int, SendingMsg> _sendingMsgMap = LinkedHashMap();
@@ -170,6 +170,13 @@ class WKConnectionManager {
         WKIM.shared.options.token == "" ||
         WKIM.shared.options.token == null) {
       Logs.error("没有初始化uid或token");
+      return;
+    }
+    if (WKIM.shared.options.protoVersion >= 6 &&
+        !WKIM.shared.options.hasExactV6SessionIdentity) {
+      Logs.error(
+        "WKProto v6 requires installationID, appInstanceID, and positive installation/session generations",
+      );
       return;
     }
     if (isNetworkUnavailable) {
@@ -510,6 +517,10 @@ class WKConnectionManager {
       CryptoUtils.init();
       var deviceID = WKIM.shared.options.installationID;
       if (deviceID == null || deviceID.isEmpty) {
+        if (WKIM.shared.options.protoVersion >= 6) {
+          Logs.error("WKProto v6 requires an exact installationID");
+          return;
+        }
         deviceID = await _getDeviceID();
       }
       if (!_isCurrentSocket(generation, connectedSocket)) {
@@ -521,6 +532,9 @@ class WKConnectionManager {
           version: WKIM.shared.options.protoVersion,
           clientKey: base64Encode(CryptoUtils.dhPublicKey!),
           deviceID: deviceID,
+          appInstanceID: WKIM.shared.options.appInstanceID ?? '',
+          installationGeneration: WKIM.shared.options.installationGeneration,
+          sessionGeneration: WKIM.shared.options.sessionGeneration,
           clientTimestamp: DateTime.now().millisecondsSinceEpoch);
       connectPacket.deviceFlag = WKIM.shared.deviceFlagApp;
       await _sendPacket(connectPacket,
