@@ -23,6 +23,8 @@ class ConnectPacket extends Packet {
   int version;
   String clientKey;
   String deviceID;
+  String appInstanceID;
+  int sessionGeneration;
   int deviceFlag;
   int clientTimestamp;
   String uid;
@@ -31,6 +33,8 @@ class ConnectPacket extends Packet {
       {this.version = 0,
       this.clientKey = "",
       this.deviceID = "",
+      this.appInstanceID = "",
+      this.sessionGeneration = 0,
       this.clientTimestamp = 0,
       this.deviceFlag = 0,
       this.uid = "",
@@ -39,7 +43,7 @@ class ConnectPacket extends Packet {
   }
   @override
   String toString() {
-    return "version:$version，clientKey：$clientKey，deviceID：$deviceID，deviceFlag：$deviceFlag，clientTimestamp:$clientTimestamp，uid：$uid，token：$token";
+    return "version:$version，deviceFlag:$deviceFlag，clientTimestamp:$clientTimestamp，sessionGeneration:$sessionGeneration";
   }
 }
 

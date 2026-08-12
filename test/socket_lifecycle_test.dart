@@ -62,7 +62,10 @@ void main() {
       'lifecycle-test-user-$testIndex',
       'lifecycle-test-token',
       addr: '127.0.0.1:${server.port}',
-    );
+    )
+      ..installationID = 'lifecycle-installation-$testIndex'
+      ..appInstanceID = 'lifecycle-app-instance-$testIndex'
+      ..sessionGeneration = testIndex;
     WKIM.shared.connectionManager.disconnect(false);
   });
 
@@ -125,7 +128,17 @@ void main() {
     await _eventually(() => clients.length == 1);
   });
 
+  test('protocol v6 fails closed without exact session identity', () async {
+    WKIM.shared.options.appInstanceID = null;
+
+    WKIM.shared.connectionManager.connect();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+
+    expect(clients, isEmpty);
+  });
+
   test('old delayed handshake does not write after disconnect', () async {
+    WKIM.shared.options.installationID = null;
     holdPreferences = Completer<void>();
     preferencesRequested = Completer<void>();
     WKIM.shared.connectionManager.connect();

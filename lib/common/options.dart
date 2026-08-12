@@ -6,6 +6,8 @@ class Options {
   int protoVersion = 0x06; // protocol version
   int deviceFlag = 0;
   String? installationID;
+  String? appInstanceID;
+  int sessionGeneration = 0;
   bool debug = true;
   Function(Function(String addr) complete)?
       getAddr; // async get connect address

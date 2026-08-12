@@ -172,6 +172,15 @@ class WKConnectionManager {
       Logs.error("没有初始化uid或token");
       return;
     }
+    if (WKIM.shared.options.protoVersion >= 6 &&
+        (WKIM.shared.options.appInstanceID == null ||
+            WKIM.shared.options.appInstanceID!.trim().isEmpty ||
+            WKIM.shared.options.sessionGeneration <= 0)) {
+      Logs.error(
+        "WKProto v6 requires appInstanceID and a positive sessionGeneration",
+      );
+      return;
+    }
     if (isNetworkUnavailable) {
       return;
     }
@@ -521,6 +530,8 @@ class WKConnectionManager {
           version: WKIM.shared.options.protoVersion,
           clientKey: base64Encode(CryptoUtils.dhPublicKey!),
           deviceID: deviceID,
+          appInstanceID: WKIM.shared.options.appInstanceID ?? '',
+          sessionGeneration: WKIM.shared.options.sessionGeneration,
           clientTimestamp: DateTime.now().millisecondsSinceEpoch);
       connectPacket.deviceFlag = WKIM.shared.deviceFlagApp;
       await _sendPacket(connectPacket,

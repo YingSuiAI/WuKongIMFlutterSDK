@@ -1,0 +1,89 @@
+{
+  "version": 3,
+  "sequence_scope": "anchor_run_global",
+  "event_types": ["open", "delta", "snapshot", "finish"],
+  "cases": [
+    {
+      "name": "open_main",
+      "event_id": "evt-1",
+      "frame_type": "open",
+      "timestamp": 1786521599900,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"open","event_key":"main","msg_event_seq":1,"visibility":"public","payload":{"snapshot":{"state":"running"}}},
+      "previous_sequence": 0,
+      "expect": {"action":"apply","watermark_key":"9001:run-42","reducer_key":"run-42:main","sequence":1,"run_terminal":false}
+    },
+    {
+      "name": "delta_main",
+      "event_id": "evt-2",
+      "frame_type": "delta",
+      "timestamp": 1786521600000,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"delta","event_key":"main","msg_event_seq":2,"visibility":"public","payload":{"kind":"text","delta":"hello"}},
+      "previous_sequence": 1,
+      "expect": {"action":"apply","watermark_key":"9001:run-42","reducer_key":"run-42:main","sequence":2,"run_terminal":false}
+    },
+    {
+      "name": "delta_tool_interleaved",
+      "event_id": "evt-3",
+      "frame_type": "delta",
+      "timestamp": 1786521600050,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"delta","event_key":"tool","msg_event_seq":3,"visibility":"public","payload":{"kind":"text","delta":"lookup"}},
+      "previous_sequence": 2,
+      "expect": {"action":"apply","watermark_key":"9001:run-42","reducer_key":"run-42:tool","sequence":3,"run_terminal":false}
+    },
+    {
+      "name": "delta_main_after_tool",
+      "event_id": "evt-4",
+      "frame_type": "delta",
+      "timestamp": 1786521600100,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"delta","event_key":"main","msg_event_seq":4,"visibility":"public","payload":{"kind":"text","delta":" world"}},
+      "previous_sequence": 3,
+      "expect": {"action":"apply","watermark_key":"9001:run-42","reducer_key":"run-42:main","sequence":4,"run_terminal":false}
+    },
+    {
+      "name": "gap",
+      "event_id": "evt-6",
+      "frame_type": "delta",
+      "timestamp": 1786521600200,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"delta","event_key":"main","msg_event_seq":6,"visibility":"public","payload":{"kind":"text","delta":"gap"}},
+      "previous_sequence": 4,
+      "expect": {"action":"snapshot_recovery","watermark_key":"9001:run-42","reducer_key":"run-42:main","sequence":6,"run_terminal":false}
+    },
+    {
+      "name": "duplicate",
+      "event_id": "evt-4",
+      "frame_type": "delta",
+      "timestamp": 1786521600300,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"delta","event_key":"main","msg_event_seq":4,"visibility":"public","payload":{"kind":"text","delta":" world"}},
+      "previous_sequence": 4,
+      "expect": {"action":"ignore_duplicate","watermark_key":"9001:run-42","reducer_key":"run-42:main","sequence":4,"run_terminal":false}
+    },
+    {
+      "name": "snapshot_recovery",
+      "event_id": "evt-6-snapshot",
+      "frame_type": "snapshot",
+      "timestamp": 1786521600400,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"snapshot","event_key":"main","msg_event_seq":6,"visibility":"public","payload":{"kind":"text","text":"hello world"}},
+      "previous_sequence": 4,
+      "expect": {"action":"apply_snapshot","watermark_key":"9001:run-42","reducer_key":"run-42:main","sequence":6,"run_terminal":false}
+    },
+    {
+      "name": "finish_on_main",
+      "event_id": "evt-7",
+      "frame_type": "finish",
+      "timestamp": 1786521600500,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"finish","event_key":"main","msg_event_seq":7,"visibility":"public","payload":{"snapshot":{"state":"succeeded","kind":"text","text":"hello world"}}},
+      "previous_sequence": 6,
+      "expect": {"action":"apply","watermark_key":"9001:run-42","reducer_key":"run-42:main","sequence":7,"run_terminal":true}
+    },
+    {
+      "name": "after_finish_rejected",
+      "event_id": "evt-8",
+      "frame_type": "delta",
+      "timestamp": 1786521600600,
+      "data": {"channel_id":"u1@agent-a","channel_type":5,"message_id":9001,"client_msg_no":"cmn-9001","run_id":"run-42","authorization_fence":"fence-7","event_type":"delta","event_key":"tool","msg_event_seq":8,"visibility":"public","payload":{"kind":"text","delta":"late"}},
+      "previous_sequence": 7,
+      "expect": {"action":"ignore_terminal","watermark_key":"9001:run-42","reducer_key":"run-42:tool","sequence":8,"run_terminal":true}
+    }
+  ],
+  "unknown_wkproto_frame": {"fixed_header_hex":"f000","expect":"ignore_without_state_change"}
+}
