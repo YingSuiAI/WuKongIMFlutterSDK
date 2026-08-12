@@ -186,6 +186,10 @@ void main() {
           'event_type': 'delta',
           'event_key': key,
           'msg_event_seq': sequence,
+          'payload': {
+            'authority_sequence': sequence,
+            'text_delta': 'hello',
+          },
         }),
       );
 
@@ -267,6 +271,7 @@ void main() {
       id: 'snapshot-followup',
       type: 'snapshot',
       sequence: 6,
+      authoritySequence: 40,
       runID: 'run-snapshot-test',
     );
     manager.restoreRunTransportWatermark(9001, 'run-snapshot-test', 3);
@@ -280,6 +285,14 @@ void main() {
         gaps.single,
         missingEventAuthoritySequence: 40,
         snapshotAuthoritySequence: 39,
+      ),
+      isFalse,
+    );
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        missingEventAuthoritySequence: 39,
+        snapshotAuthoritySequence: 40,
       ),
       isFalse,
     );
@@ -437,6 +450,7 @@ EventPacket _event({
   int messageID = 9001,
   String runID = 'run-42',
   String eventKey = 'main',
+  int? authoritySequence,
 }) =>
     EventPacket()
       ..eventID = id
@@ -450,8 +464,12 @@ EventPacket _event({
           'event_key': eventKey,
           'msg_event_seq': sequence,
           'payload': type == 'delta'
-              ? {'text_delta': 'hello'}
+              ? {
+                  'authority_sequence': authoritySequence ?? sequence,
+                  'text_delta': 'hello',
+                }
               : {
+                  'authority_sequence': authoritySequence ?? sequence,
                   'snapshot': {'state': 'running', 'text': 'hello'},
                 },
         }),

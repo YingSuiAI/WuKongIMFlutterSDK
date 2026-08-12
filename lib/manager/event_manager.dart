@@ -24,6 +24,7 @@ class _WKEventEnvelope {
   final String eventType;
   final String eventKey;
   final int sequence;
+  final int authoritySequence;
 
   const _WKEventEnvelope(
     this.messageID,
@@ -31,6 +32,7 @@ class _WKEventEnvelope {
     this.eventType,
     this.eventKey,
     this.sequence,
+    this.authoritySequence,
   );
 
   String get watermarkKey => '$messageID:$runID';
@@ -97,6 +99,7 @@ class WKEventManager {
         envelope.messageID != gap.messageID ||
         envelope.runID != gap.runID ||
         envelope.sequence != gap.receivedMsgEventSequence ||
+        envelope.authoritySequence != missingEventAuthoritySequence ||
         gap.expectedMsgEventSequence <= 0 ||
         gap.expectedMsgEventSequence >= gap.receivedMsgEventSequence) {
       return false;
@@ -165,6 +168,9 @@ class WKEventManager {
     final eventType = data['event_type'];
     final eventKey = data['event_key'];
     final sequence = data['msg_event_seq'];
+    final payload = data['payload'];
+    final authoritySequence =
+        payload is Map<String, dynamic> ? payload['authority_sequence'] : null;
     if (messageID is! int ||
         messageID <= 0 ||
         runID is! String ||
@@ -174,7 +180,9 @@ class WKEventManager {
         eventKey is! String ||
         eventKey.trim().isEmpty ||
         sequence is! int ||
-        sequence <= 0) {
+        sequence <= 0 ||
+        authoritySequence is! int ||
+        authoritySequence <= 0) {
       return null;
     }
     return _WKEventEnvelope(
@@ -183,6 +191,7 @@ class WKEventManager {
       eventType,
       eventKey.trim(),
       sequence,
+      authoritySequence,
     );
   }
 
