@@ -345,7 +345,7 @@ class WKConnectionManager {
         _cacheData = lastMsgBytes = bytes;
       } else {
         if (packetType <= 0x0f) {
-          if (lastMsgBytes.length < 5) {
+          if (lastMsgBytes.length < 2) {
             _cacheData = lastMsgBytes;
             break;
           }

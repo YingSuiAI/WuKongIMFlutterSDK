@@ -67,6 +67,9 @@ class ReadData {
     var multiplier = 0;
     var rLength = 0;
     while (multiplier < 27) {
+      if (remainingLength == 0) {
+        return -1;
+      }
       var b = readUint8();
       /* tslint:disable */
       rLength = rLength | ((b & 127) << multiplier);

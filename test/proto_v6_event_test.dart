@@ -61,6 +61,7 @@ void main() {
 
   test('connection manager dispatches one copy of a repeated EVENT', () {
     final manager = WKConnectionManager.shared;
+    WKEventManager.shared.reset();
     final received = <EventPacket>[];
     manager.addOnEventListener('proto-v6-test', received.add);
     final frame = Uint8List.fromList(
@@ -70,6 +71,40 @@ void main() {
 
     expect(received, hasLength(1));
     manager.removeOnEventListener('proto-v6-test');
+  });
+
+  test('socket parser skips a short unknown frame and continues', () {
+    final manager = WKConnectionManager.shared;
+    WKEventManager.shared.reset();
+    final received = <EventPacket>[];
+    manager.addOnEventListener('unknown-frame-test', received.add);
+    final event =
+        HEX.decode('c01a000631323334353600047465737400000000499602d274657374');
+
+    manager.testCutData(Uint8List.fromList([0xf0, 0x01, 0x2a, ...event]));
+
+    expect(received, hasLength(1));
+    manager.removeOnEventListener('unknown-frame-test');
+  });
+
+  test('socket parser waits for a split remaining-length header', () {
+    final manager = WKConnectionManager.shared;
+    WKEventManager.shared.reset();
+    final received = <EventPacket>[];
+    manager.addOnEventListener('split-header-test', received.add);
+    final frame = Uint8List.fromList([
+      0xc0,
+      0x80 | 26,
+      0x00,
+      ...HEX.decode('000631323334353600047465737400000000499602d274657374'),
+    ]);
+
+    manager.testCutData(frame.sublist(0, 2));
+    expect(received, isEmpty);
+    manager.testCutData(frame.sublist(2));
+
+    expect(received, hasLength(1));
+    manager.removeOnEventListener('split-header-test');
   });
 
   test('event manager reports a sequence gap and ignores late terminal data',
