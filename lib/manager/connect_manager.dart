@@ -116,7 +116,7 @@ class WKConnectionManager {
   final int reconnMilliseconds = 1500;
   Timer? heartTimer;
   Timer? checkNetworkTimer;
-  final heartIntervalSecond = const Duration(seconds: 60);
+  final heartIntervalSecond = const Duration(seconds: 30);
   final checkNetworkSecond = const Duration(seconds: 1);
   int unReceivePongCount = 0;
   final LinkedHashMap<int, SendingMsg> _sendingMsgMap = LinkedHashMap();
