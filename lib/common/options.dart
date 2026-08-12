@@ -7,6 +7,7 @@ class Options {
   int deviceFlag = 0;
   String? installationID;
   String? appInstanceID;
+  int installationGeneration = 0;
   int sessionGeneration = 0;
   bool debug = true;
   Function(Function(String addr) complete)?

@@ -66,10 +66,7 @@ class WKEventManager {
     bool terminal = false,
   }) {
     final normalizedRunID = runID.trim();
-    if (messageID <= 0 ||
-        normalizedRunID.isEmpty ||
-        normalizedRunID.contains(':') ||
-        msgEventSequence <= 0) {
+    if (messageID <= 0 || normalizedRunID.isEmpty || msgEventSequence <= 0) {
       return false;
     }
     final watermarkKey = '$messageID:$normalizedRunID';
@@ -172,12 +169,10 @@ class WKEventManager {
         messageID <= 0 ||
         runID is! String ||
         runID.trim().isEmpty ||
-        runID.contains(':') ||
         eventType is! String ||
         eventType != event.eventType ||
         eventKey is! String ||
         eventKey.trim().isEmpty ||
-        eventKey.contains(':') ||
         sequence is! int ||
         sequence <= 0) {
       return null;

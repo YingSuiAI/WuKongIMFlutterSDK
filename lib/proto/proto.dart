@@ -96,6 +96,7 @@ Uint8List encodeConnect(ConnectPacket packet) {
   write.writeString(packet.clientKey);
   if (packet.version == 6) {
     write.writeString(packet.appInstanceID);
+    write.writeUint64(BigInt.from(packet.installationGeneration));
     write.writeUint64(BigInt.from(packet.sessionGeneration));
   }
   return write.toUint8List();

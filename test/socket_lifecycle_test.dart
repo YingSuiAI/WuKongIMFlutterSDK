@@ -65,6 +65,7 @@ void main() {
     )
       ..installationID = 'lifecycle-installation-$testIndex'
       ..appInstanceID = 'lifecycle-app-instance-$testIndex'
+      ..installationGeneration = testIndex
       ..sessionGeneration = testIndex;
     WKIM.shared.connectionManager.disconnect(false);
   });

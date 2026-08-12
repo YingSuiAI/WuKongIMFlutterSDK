@@ -175,9 +175,10 @@ class WKConnectionManager {
     if (WKIM.shared.options.protoVersion >= 6 &&
         (WKIM.shared.options.appInstanceID == null ||
             WKIM.shared.options.appInstanceID!.trim().isEmpty ||
+            WKIM.shared.options.installationGeneration <= 0 ||
             WKIM.shared.options.sessionGeneration <= 0)) {
       Logs.error(
-        "WKProto v6 requires appInstanceID and a positive sessionGeneration",
+        "WKProto v6 requires appInstanceID and positive installation/session generations",
       );
       return;
     }
@@ -531,6 +532,7 @@ class WKConnectionManager {
           clientKey: base64Encode(CryptoUtils.dhPublicKey!),
           deviceID: deviceID,
           appInstanceID: WKIM.shared.options.appInstanceID ?? '',
+          installationGeneration: WKIM.shared.options.installationGeneration,
           sessionGeneration: WKIM.shared.options.sessionGeneration,
           clientTimestamp: DateTime.now().millisecondsSinceEpoch);
       connectPacket.deviceFlag = WKIM.shared.deviceFlagApp;

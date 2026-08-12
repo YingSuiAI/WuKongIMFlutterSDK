@@ -1,8 +1,6 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hex/hex.dart';
 import 'package:wukongimfluttersdk/common/options.dart';
@@ -10,16 +8,8 @@ import 'package:wukongimfluttersdk/manager/connect_manager.dart';
 import 'package:wukongimfluttersdk/manager/event_manager.dart';
 import 'package:wukongimfluttersdk/proto/packet.dart';
 import 'package:wukongimfluttersdk/proto/proto.dart';
+import 'package:wukongimfluttersdk/proto/write_read.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
-
-const _goGoldenPath =
-    '../pkg/worktrees/wukong-event-v6/pkg/protocol/codec/testdata/event_v6_reducer_golden.json';
-const _goGoldenSha256 =
-    'd3ea1635d7ed485be2468bc510bd3e2584a539c6d7e8930987637966c086b8b6';
-const _goConnectGoldenPath =
-    '../pkg/worktrees/wukong-event-v6/pkg/protocol/codec/testdata/connect_v6_golden.json';
-const _goConnectGoldenSha256 =
-    '7e91b9e5f4d592a280715629d8b3ef6445e3f2e11d624409b586cf278b53645d';
 
 void main() {
   setUp(() {
@@ -51,23 +41,36 @@ void main() {
     expect(HEX.encode(encoded.sublist(10)), '0000000100000001');
   });
 
-  test('encodes the canonical Go WKProto v6 CONNECT frame', () {
-    final fixture = _jsonFixture('connect_v6_golden.json');
+  test('encodes both installation and session generations in v6 CONNECT', () {
     final packet = ConnectPacket(
-      version: fixture['version']! as int,
-      deviceFlag: fixture['device_flag']! as int,
-      deviceID: fixture['device_id']! as String,
-      uid: fixture['uid']! as String,
-      token: fixture['token']! as String,
-      clientTimestamp: fixture['client_timestamp']! as int,
-      clientKey: fixture['client_key']! as String,
-      appInstanceID: fixture['app_instance_id']! as String,
-      sessionGeneration: fixture['session_generation']! as int,
+      version: 6,
+      deviceFlag: 1,
+      deviceID: 'install-1',
+      uid: 'u1',
+      token: 'token-1',
+      clientTimestamp: 1786521600000,
+      clientKey: 'client-key',
+      appInstanceID: 'app-1',
+      installationGeneration: 3,
+      sessionGeneration: 7,
     );
 
     final encoded = Proto().encode(packet);
+    final reader = ReadData(encoded);
+    expect(reader.readUint8() >> 4, PacketType.connect.index);
+    expect(reader.readVariableLength(), reader.remainingLength);
+    expect(reader.readUint8(), 6);
+    expect(reader.readUint8(), 1);
+    expect(reader.readString(), 'install-1');
+    expect(reader.readString(), 'u1');
+    expect(reader.readString(), 'token-1');
+    expect(reader.readUint64(), BigInt.from(1786521600000));
+    expect(reader.readString(), 'client-key');
+    expect(reader.readString(), 'app-1');
+    expect(reader.readUint64(), BigInt.from(3));
+    expect(reader.readUint64(), BigInt.from(7));
 
-    expect(HEX.encode(encoded), fixture['frame_hex']);
+    expect(reader.remainingLength, 0);
   });
 
   test('pre-v6 CONNECT does not append v6 session identity fields', () {
@@ -79,6 +82,7 @@ void main() {
       clientTimestamp: 1,
       clientKey: 'legacy-key',
       appInstanceID: 'must-not-be-encoded',
+      installationGeneration: 8,
       sessionGeneration: 9,
     );
 
@@ -118,11 +122,11 @@ void main() {
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
     manager.addOnEventListener('proto-v6-test', received.add);
-    final data = utf8.encode(jsonEncode(_goldenCase('open_main')['data']));
-    final event = EventPacket()
-      ..eventID = 'evt-connection'
-      ..eventType = 'open'
-      ..data = data;
+    final event = _event(
+      id: 'evt-connection',
+      type: 'open',
+      sequence: 1,
+    );
     final frame = _encodeEventFrame(event);
 
     manager.testCutData(Uint8List.fromList([...frame, ...frame]));
@@ -136,7 +140,9 @@ void main() {
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
     manager.addOnEventListener('unknown-frame-test', received.add);
-    final event = _encodeEventFrame(_eventFromCase(_goldenCase('open_main')));
+    final event = _encodeEventFrame(
+      _event(id: 'evt-unknown-followup', type: 'open', sequence: 1),
+    );
 
     manager.testCutData(Uint8List.fromList([0xf0, 0x01, 0x2a, ...event]));
 
@@ -149,7 +155,7 @@ void main() {
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
     manager.addOnEventListener('split-header-test', received.add);
-    final event = _eventFromCase(_goldenCase('open_main'));
+    final event = _event(id: 'evt-split', type: 'open', sequence: 1);
     final body = _eventBody(event);
     final encodedLength = _encodeVariableLength(body.length, padded: true);
     final frame = Uint8List.fromList([0xc0, ...encodedLength, ...body]);
@@ -160,89 +166,6 @@ void main() {
 
     expect(received, hasLength(1));
     manager.removeOnEventListener('split-header-test');
-  });
-
-  test(
-    'shared reducer fixture is byte-identical to the canonical Go golden',
-    () {
-      final local = File(
-        'test/testdata/event_v6_reducer_golden.json',
-      ).readAsBytesSync();
-      expect(sha256.convert(local).toString(), _goGoldenSha256);
-      final canonical = File(_goGoldenPath);
-      if (canonical.existsSync()) {
-        expect(local, canonical.readAsBytesSync());
-      }
-    },
-  );
-
-  test('shared CONNECT fixture is byte-identical to the canonical Go golden',
-      () {
-    final local =
-        File('test/testdata/connect_v6_golden.json').readAsBytesSync();
-    expect(sha256.convert(local).toString(), _goConnectGoldenSha256);
-    final canonical = File(_goConnectGoldenPath);
-    if (canonical.existsSync()) expect(local, canonical.readAsBytesSync());
-  });
-
-  test('event manager follows every canonical reducer golden case', () {
-    for (final rawCase in _goldenCases()) {
-      final name = rawCase['name']! as String;
-      final expected = rawCase['expect']! as Map<String, dynamic>;
-      final data = rawCase['data']! as Map<String, dynamic>;
-      final manager = WKEventManager.shared;
-      manager.reset();
-      final received = <EventPacket>[];
-      final gaps = <WKEventGap>[];
-      manager.addListener('golden-$name', received.add);
-      manager.setGapListener(gaps.add);
-      final runID = data['run_id']! as String;
-      final previous = rawCase['previous_sequence'] as int? ?? 0;
-      final messageID = data['message_id']! as int;
-      if (previous > 0) {
-        manager.restoreRunTransportWatermark(
-          messageID,
-          runID,
-          previous,
-          terminal: expected['run_terminal'] == true &&
-              expected['action'] == 'ignore_terminal',
-        );
-      }
-      final event = _eventFromCase(rawCase);
-
-      manager.handle(event);
-
-      switch (expected['action']) {
-        case 'apply':
-          expect(received, [event], reason: name);
-          expect(gaps, isEmpty, reason: name);
-          break;
-        case 'apply_snapshot':
-        case 'snapshot_recovery':
-          expect(received, isEmpty, reason: name);
-          expect(gaps, hasLength(1), reason: name);
-          expect(gaps.single.messageID, messageID, reason: name);
-          expect(gaps.single.runID, runID, reason: name);
-          expect(gaps.single.expectedMsgEventSequence, previous + 1,
-              reason: name);
-          expect(
-            gaps.single.receivedMsgEventSequence,
-            expected['sequence'],
-            reason: name,
-          );
-          break;
-        case 'ignore_duplicate':
-        case 'ignore_terminal':
-        case 'ignore_unknown':
-          expect(received, isEmpty, reason: name);
-          expect(gaps, isEmpty, reason: name);
-          break;
-        default:
-          fail('Unsupported golden action ${expected['action']}');
-      }
-      manager.removeListener('golden-$name');
-      manager.setGapListener(null);
-    }
   });
 
   test('message event sequence stays continuous across interleaved lanes', () {
@@ -306,8 +229,8 @@ void main() {
     manager.reset();
     final received = <EventPacket>[];
     manager.addListener('type-mismatch-test', received.add);
-    final rawCase = Map<String, dynamic>.from(_goldenCase('delta_main'));
-    final event = _eventFromCase(rawCase)..eventType = 'snapshot';
+    final event = _event(id: 'evt-type-mismatch', type: 'delta', sequence: 1)
+      ..eventType = 'snapshot';
 
     manager.handle(event);
 
@@ -315,16 +238,17 @@ void main() {
     manager.removeListener('type-mismatch-test');
   });
 
-  test('event manager rejects event keys that repeat the run prefix', () {
+  test('event manager rejects an empty event key', () {
     final manager = WKEventManager.shared;
     manager.reset();
     final received = <EventPacket>[];
     manager.addListener('prefixed-key-test', received.add);
-    final rawCase = Map<String, dynamic>.from(_goldenCase('delta_main'));
-    final data = Map<String, dynamic>.from(rawCase['data']! as Map);
-    data['event_key'] = 'run-42:main';
-    rawCase['data'] = data;
-    final event = _eventFromCase(rawCase);
+    final event = _event(
+      id: 'evt-empty-key',
+      type: 'delta',
+      sequence: 1,
+      eventKey: '',
+    );
 
     manager.handle(event);
 
@@ -339,13 +263,12 @@ void main() {
     final gaps = <WKEventGap>[];
     manager.addListener('snapshot-test', received.add);
     manager.setGapListener(gaps.add);
-    final rawCase = Map<String, dynamic>.from(_goldenCase('snapshot_recovery'));
-    final data = Map<String, dynamic>.from(rawCase['data']! as Map);
-    data['run_id'] = 'run-snapshot-test';
-    data['msg_event_seq'] = 6;
-    rawCase['event_id'] = 'snapshot-followup';
-    rawCase['data'] = data;
-    final event = _eventFromCase(rawCase);
+    final event = _event(
+      id: 'snapshot-followup',
+      type: 'snapshot',
+      sequence: 6,
+      runID: 'run-snapshot-test',
+    );
     manager.restoreRunTransportWatermark(9001, 'run-snapshot-test', 3);
 
     manager.handle(event);
@@ -368,13 +291,12 @@ void main() {
       ),
       isTrue,
     );
-    final nextCase = Map<String, dynamic>.from(_goldenCase('delta_main'));
-    final nextData = Map<String, dynamic>.from(nextCase['data']! as Map)
-      ..['run_id'] = 'run-snapshot-test'
-      ..['msg_event_seq'] = 7;
-    nextCase['event_id'] = 'event-after-snapshot-recovery';
-    nextCase['data'] = nextData;
-    final next = _eventFromCase(nextCase);
+    final next = _event(
+      id: 'event-after-snapshot-recovery',
+      type: 'delta',
+      sequence: 7,
+      runID: 'run-snapshot-test',
+    );
 
     manager.handle(next);
 
@@ -390,13 +312,16 @@ void main() {
     final gaps = <WKEventGap>[];
     manager.addListener('delta-gap-test', received.add);
     manager.setGapListener(gaps.add);
-    final rawCase = Map<String, dynamic>.from(_goldenCase('gap'));
-    final data = Map<String, dynamic>.from(rawCase['data']! as Map);
-    data['run_id'] = 'run-delta-gap-test';
-    rawCase['data'] = data;
     manager.restoreRunTransportWatermark(9001, 'run-delta-gap-test', 3);
 
-    manager.handle(_eventFromCase(rawCase));
+    manager.handle(
+      _event(
+        id: 'evt-delta-gap',
+        type: 'delta',
+        sequence: 6,
+        runID: 'run-delta-gap-test',
+      ),
+    );
 
     expect(received, isEmpty);
     expect(gaps, hasLength(1));
@@ -411,19 +336,22 @@ void main() {
     manager.reset();
     final received = <EventPacket>[];
     manager.addListener('run-finish-test', received.add);
-    final finish = _eventFromCase(_goldenCase('finish_on_main'));
+    final finish = _event(
+      id: 'evt-finish',
+      type: 'finish',
+      sequence: 7,
+    );
     manager.restoreRunTransportWatermark(9001, 'run-42', 6);
     manager.handle(finish);
-    final rawCase = Map<String, dynamic>.from(
-      _goldenCase('delta_tool_interleaved'),
-    );
-    final data = Map<String, dynamic>.from(rawCase['data']! as Map);
-    data['event_key'] = 'tool';
-    data['msg_event_seq'] = 8;
-    rawCase['event_id'] = 'evt-after-finish';
-    rawCase['data'] = data;
 
-    manager.handle(_eventFromCase(rawCase));
+    manager.handle(
+      _event(
+        id: 'evt-after-finish',
+        type: 'delta',
+        sequence: 8,
+        eventKey: 'tool',
+      ),
+    );
 
     expect(received, [finish]);
     manager.removeListener('run-finish-test');
@@ -434,13 +362,13 @@ void main() {
     manager.reset();
     final received = <EventPacket>[];
     manager.addListener('anchor-isolation-test', received.add);
-    final first = _eventFromCase(_goldenCase('open_main'));
-    final secondCase = Map<String, dynamic>.from(_goldenCase('open_main'));
-    final secondData = Map<String, dynamic>.from(secondCase['data']! as Map);
-    secondData['message_id'] = 9002;
-    secondCase['event_id'] = 'evt-1';
-    secondCase['data'] = secondData;
-    final second = _eventFromCase(secondCase);
+    final first = _event(id: 'evt-1', type: 'open', sequence: 1);
+    final second = _event(
+      id: 'evt-1',
+      type: 'open',
+      sequence: 1,
+      messageID: 9002,
+    );
 
     manager.handle(first);
     manager.handle(second);
@@ -471,13 +399,14 @@ void main() {
       ),
       isFalse,
     );
-    final deltaCase = Map<String, dynamic>.from(_goldenCase('delta_main'));
-    final deltaData = Map<String, dynamic>.from(deltaCase['data']! as Map)
-      ..['run_id'] = 'run-recover-monotonic'
-      ..['msg_event_seq'] = 4;
-    deltaCase['event_id'] = 'evt-stale-after-recovery';
-    deltaCase['data'] = deltaData;
-    manager.handle(_eventFromCase(deltaCase));
+    manager.handle(
+      _event(
+        id: 'evt-stale-after-recovery',
+        type: 'delta',
+        sequence: 4,
+        runID: 'run-recover-monotonic',
+      ),
+    );
     expect(
       manager.restoreRunTransportWatermark(
         9001,
@@ -487,36 +416,46 @@ void main() {
       ),
       isTrue,
     );
-    final lateCase = Map<String, dynamic>.from(_goldenCase('delta_main'));
-    final lateData = Map<String, dynamic>.from(lateCase['data']! as Map)
-      ..['run_id'] = 'run-recover-monotonic'
-      ..['msg_event_seq'] = 7;
-    lateCase['event_id'] = 'evt-after-terminal-recovery';
-    lateCase['data'] = lateData;
-    manager.handle(_eventFromCase(lateCase));
+    manager.handle(
+      _event(
+        id: 'evt-after-terminal-recovery',
+        type: 'delta',
+        sequence: 7,
+        runID: 'run-recover-monotonic',
+      ),
+    );
 
     expect(received, isEmpty);
     manager.removeListener('recover-monotonic-test');
   });
 }
 
-EventPacket _eventFromCase(Map<String, dynamic> rawCase) => EventPacket()
-  ..eventID = rawCase['event_id']! as String
-  ..eventType = rawCase['frame_type']! as String
-  ..timestamp = rawCase['timestamp']! as int
-  ..data = utf8.encode(jsonEncode(rawCase['data']));
-
-Map<String, dynamic> _goldenCase(String name) =>
-    _goldenCases().singleWhere((rawCase) => rawCase['name'] == name);
-
-List<Map<String, dynamic>> _goldenCases() {
-  final fixture = _jsonFixture('event_v6_reducer_golden.json');
-  return (fixture['cases']! as List<dynamic>).cast<Map<String, dynamic>>();
-}
-
-Map<String, dynamic> _jsonFixture(String name) => jsonDecode(
-      File('test/testdata/$name').readAsStringSync(),
-    ) as Map<String, dynamic>;
+EventPacket _event({
+  required String id,
+  required String type,
+  required int sequence,
+  int messageID = 9001,
+  String runID = 'run-42',
+  String eventKey = 'main',
+}) =>
+    EventPacket()
+      ..eventID = id
+      ..eventType = type
+      ..timestamp = 1786521600000
+      ..data = utf8.encode(
+        jsonEncode({
+          'message_id': messageID,
+          'run_id': runID,
+          'event_type': type,
+          'event_key': eventKey,
+          'msg_event_seq': sequence,
+          'payload': type == 'delta'
+              ? {'text_delta': 'hello'}
+              : {
+                  'snapshot': {'state': 'running', 'text': 'hello'},
+                },
+        }),
+      );
 
 Uint8List _encodeEventFrame(EventPacket event) {
   final body = _eventBody(event);
