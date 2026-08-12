@@ -10,6 +10,10 @@ class WkMessageContentType {
   static const file = 8;
   static const contentFormatError = 97;
   static const insideMsg = 99;
+
+  /// Local-only metadata for project JSON envelopes.
+  /// Never written into the envelope.
+  static const projectJson = 1000;
 }
 
 class WKChannelType {
