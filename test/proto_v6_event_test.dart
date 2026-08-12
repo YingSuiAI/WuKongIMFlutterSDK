@@ -200,7 +200,7 @@ void main() {
       final previous = rawCase['previous_sequence'] as int? ?? 0;
       final messageID = data['message_id']! as int;
       if (previous > 0) {
-        manager.recoverRun(
+        manager.restoreRunTransportWatermark(
           messageID,
           runID,
           previous,
@@ -214,18 +214,19 @@ void main() {
 
       switch (expected['action']) {
         case 'apply':
-        case 'apply_snapshot':
           expect(received, [event], reason: name);
           expect(gaps, isEmpty, reason: name);
           break;
+        case 'apply_snapshot':
         case 'snapshot_recovery':
           expect(received, isEmpty, reason: name);
           expect(gaps, hasLength(1), reason: name);
-          expect(gaps.single.streamKey, expected['watermark_key'],
+          expect(gaps.single.messageID, messageID, reason: name);
+          expect(gaps.single.runID, runID, reason: name);
+          expect(gaps.single.expectedMsgEventSequence, previous + 1,
               reason: name);
-          expect(gaps.single.expectedSequence, previous + 1, reason: name);
           expect(
-            gaps.single.receivedSequence,
+            gaps.single.receivedMsgEventSequence,
             expected['sequence'],
             reason: name,
           );
@@ -331,11 +332,13 @@ void main() {
     manager.removeListener('prefixed-key-test');
   });
 
-  test('event manager resumes after applying an authoritative snapshot', () {
+  test('event manager resumes only after Platform snapshot covers a gap', () {
     final manager = WKEventManager.shared;
     manager.reset();
     final received = <EventPacket>[];
+    final gaps = <WKEventGap>[];
     manager.addListener('snapshot-test', received.add);
+    manager.setGapListener(gaps.add);
     final rawCase = Map<String, dynamic>.from(_goldenCase('snapshot_recovery'));
     final data = Map<String, dynamic>.from(rawCase['data']! as Map);
     data['run_id'] = 'run-snapshot-test';
@@ -343,12 +346,41 @@ void main() {
     rawCase['event_id'] = 'snapshot-followup';
     rawCase['data'] = data;
     final event = _eventFromCase(rawCase);
-    manager.recoverRun(9001, 'run-snapshot-test', 3);
+    manager.restoreRunTransportWatermark(9001, 'run-snapshot-test', 3);
 
     manager.handle(event);
 
-    expect(received, [event]);
+    expect(received, isEmpty);
+    expect(gaps, hasLength(1));
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        missingEventAuthoritySequence: 40,
+        snapshotAuthoritySequence: 39,
+      ),
+      isFalse,
+    );
+    expect(
+      manager.completeGapRecovery(
+        gaps.single,
+        missingEventAuthoritySequence: 40,
+        snapshotAuthoritySequence: 40,
+      ),
+      isTrue,
+    );
+    final nextCase = Map<String, dynamic>.from(_goldenCase('delta_main'));
+    final nextData = Map<String, dynamic>.from(nextCase['data']! as Map)
+      ..['run_id'] = 'run-snapshot-test'
+      ..['msg_event_seq'] = 7;
+    nextCase['event_id'] = 'event-after-snapshot-recovery';
+    nextCase['data'] = nextData;
+    final next = _eventFromCase(nextCase);
+
+    manager.handle(next);
+
+    expect(received, [next]);
     manager.removeListener('snapshot-test');
+    manager.setGapListener(null);
   });
 
   test('ordinary delta with the same gap is rejected', () {
@@ -362,14 +394,14 @@ void main() {
     final data = Map<String, dynamic>.from(rawCase['data']! as Map);
     data['run_id'] = 'run-delta-gap-test';
     rawCase['data'] = data;
-    manager.recoverRun(9001, 'run-delta-gap-test', 3);
+    manager.restoreRunTransportWatermark(9001, 'run-delta-gap-test', 3);
 
     manager.handle(_eventFromCase(rawCase));
 
     expect(received, isEmpty);
     expect(gaps, hasLength(1));
-    expect(gaps.single.expectedSequence, 4);
-    expect(gaps.single.receivedSequence, 6);
+    expect(gaps.single.expectedMsgEventSequence, 4);
+    expect(gaps.single.receivedMsgEventSequence, 6);
     manager.removeListener('delta-gap-test');
     manager.setGapListener(null);
   });
@@ -380,7 +412,7 @@ void main() {
     final received = <EventPacket>[];
     manager.addListener('run-finish-test', received.add);
     final finish = _eventFromCase(_goldenCase('finish_on_main'));
-    manager.recoverRun(9001, 'run-42', 6);
+    manager.restoreRunTransportWatermark(9001, 'run-42', 6);
     manager.handle(finish);
     final rawCase = Map<String, dynamic>.from(
       _goldenCase('delta_tool_interleaved'),
@@ -417,13 +449,28 @@ void main() {
     manager.removeListener('anchor-isolation-test');
   });
 
-  test('recoverRun never moves a terminal or advanced watermark backwards', () {
+  test('transport recovery never uses or stores Platform authority sequence',
+      () {
     final manager = WKEventManager.shared;
     manager.reset();
     final received = <EventPacket>[];
     manager.addListener('recover-monotonic-test', received.add);
-    manager.recoverRun(9001, 'run-recover-monotonic', 5);
-    manager.recoverRun(9001, 'run-recover-monotonic', 3);
+    expect(
+      manager.restoreRunTransportWatermark(
+        9001,
+        'run-recover-monotonic',
+        5,
+      ),
+      isTrue,
+    );
+    expect(
+      manager.restoreRunTransportWatermark(
+        9001,
+        'run-recover-monotonic',
+        3,
+      ),
+      isFalse,
+    );
     final deltaCase = Map<String, dynamic>.from(_goldenCase('delta_main'));
     final deltaData = Map<String, dynamic>.from(deltaCase['data']! as Map)
       ..['run_id'] = 'run-recover-monotonic'
@@ -431,7 +478,15 @@ void main() {
     deltaCase['event_id'] = 'evt-stale-after-recovery';
     deltaCase['data'] = deltaData;
     manager.handle(_eventFromCase(deltaCase));
-    manager.recoverRun(9001, 'run-recover-monotonic', 6, terminal: true);
+    expect(
+      manager.restoreRunTransportWatermark(
+        9001,
+        'run-recover-monotonic',
+        6,
+        terminal: true,
+      ),
+      isTrue,
+    );
     final lateCase = Map<String, dynamic>.from(_goldenCase('delta_main'));
     final lateData = Map<String, dynamic>.from(lateCase['data']! as Map)
       ..['run_id'] = 'run-recover-monotonic'

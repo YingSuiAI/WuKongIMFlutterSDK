@@ -4,15 +4,17 @@ import '../proto/packet.dart';
 
 class WKEventGap {
   final EventPacket event;
-  final String streamKey;
-  final int expectedSequence;
-  final int receivedSequence;
+  final int messageID;
+  final String runID;
+  final int expectedMsgEventSequence;
+  final int receivedMsgEventSequence;
 
   const WKEventGap(
     this.event,
-    this.streamKey,
-    this.expectedSequence,
-    this.receivedSequence,
+    this.messageID,
+    this.runID,
+    this.expectedMsgEventSequence,
+    this.receivedMsgEventSequence,
   );
 }
 
@@ -57,26 +59,57 @@ class WKEventManager {
     _gapListener = listener;
   }
 
-  void recoverRun(
+  bool restoreRunTransportWatermark(
     int messageID,
     String runID,
-    int authoritySequence, {
+    int msgEventSequence, {
     bool terminal = false,
   }) {
     final normalizedRunID = runID.trim();
     if (messageID <= 0 ||
         normalizedRunID.isEmpty ||
         normalizedRunID.contains(':') ||
-        authoritySequence <= 0) {
-      return;
+        msgEventSequence <= 0) {
+      return false;
     }
     final watermarkKey = '$messageID:$normalizedRunID';
     final previous = _runSequences[watermarkKey] ?? 0;
-    if (authoritySequence < previous || _terminalRuns.contains(watermarkKey)) {
-      return;
+    if (msgEventSequence < previous || _terminalRuns.contains(watermarkKey)) {
+      return false;
     }
-    _runSequences[watermarkKey] = authoritySequence;
+    _runSequences[watermarkKey] = msgEventSequence;
     if (terminal) _terminalRuns.add(watermarkKey);
+    return true;
+  }
+
+  /// Completes one transport gap only after a Platform snapshot covers the
+  /// authoritative event carried by [gap]. Platform authority sequence and
+  /// WuKongIM msg_event_seq are deliberately compared and stored separately.
+  bool completeGapRecovery(
+    WKEventGap gap, {
+    required int missingEventAuthoritySequence,
+    required int snapshotAuthoritySequence,
+    bool terminal = false,
+  }) {
+    if (missingEventAuthoritySequence <= 0 ||
+        snapshotAuthoritySequence < missingEventAuthoritySequence) {
+      return false;
+    }
+    final envelope = _decodeEnvelope(gap.event);
+    if (envelope == null ||
+        envelope.messageID != gap.messageID ||
+        envelope.runID != gap.runID ||
+        envelope.sequence != gap.receivedMsgEventSequence ||
+        gap.expectedMsgEventSequence <= 0 ||
+        gap.expectedMsgEventSequence >= gap.receivedMsgEventSequence) {
+      return false;
+    }
+    return restoreRunTransportWatermark(
+      gap.messageID,
+      gap.runID,
+      gap.receivedMsgEventSequence,
+      terminal: terminal,
+    );
   }
 
   void reset() {
@@ -100,10 +133,15 @@ class WKEventManager {
     if (_terminalRuns.contains(watermarkKey)) return;
     final lastSequence = _runSequences[watermarkKey] ?? 0;
     if (envelope.sequence <= lastSequence) return;
-    final isAuthoritativeSnapshot = envelope.eventType == 'snapshot';
-    if (!isAuthoritativeSnapshot && envelope.sequence != lastSequence + 1) {
+    if (envelope.sequence != lastSequence + 1) {
       _gapListener?.call(
-        WKEventGap(event, watermarkKey, lastSequence + 1, envelope.sequence),
+        WKEventGap(
+          event,
+          envelope.messageID,
+          envelope.runID,
+          lastSequence + 1,
+          envelope.sequence,
+        ),
       );
       return;
     }
