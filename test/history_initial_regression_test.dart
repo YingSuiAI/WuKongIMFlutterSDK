@@ -6,6 +6,7 @@ import 'package:sqflite/sqflite.dart';
 // ignore: depend_on_referenced_packages
 import 'package:sqflite_common/src/factory.dart';
 import 'package:wukongimfluttersdk/db/message.dart';
+import 'package:wukongimfluttersdk/db/wk_database_migrator.dart';
 import 'package:wukongimfluttersdk/db/wk_db_helper.dart';
 import 'package:wukongimfluttersdk/entity/msg.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
@@ -62,7 +63,7 @@ void main() {
     expect(syncRequests, 1);
     expect(messages.map((message) => message.messageSeq), [2, 1]);
     WKIM.shared.messageManager.addOnSyncChannelMsgListener(null);
-    WKDBHelper.shared.close();
+    await WKDBHelper.shared.close();
   });
 
   test('without a sync listener the initial page remains local-only', () async {
@@ -86,7 +87,7 @@ void main() {
 
     final messages = await result.future;
     expect(messages.map((message) => message.messageSeq), [1]);
-    WKDBHelper.shared.close();
+    await WKDBHelper.shared.close();
   });
 }
 
@@ -140,6 +141,9 @@ class _HistoryDatabase implements Database {
   @override
   Future<List<Map<String, Object?>>> rawQuery(String sql,
       [List<Object?>? arguments]) async {
+    if (sql.trimLeft().toUpperCase().startsWith('PRAGMA ')) {
+      return <Map<String, Object?>>[];
+    }
     _rawQueryCount++;
     if (_rawQueryCount == 1) return [_messageRow(1)];
     return [_messageRow(1), _messageRow(2)];
@@ -155,8 +159,14 @@ class _HistoryDatabase implements Database {
           String? having,
           String? orderBy,
           int? limit,
-          int? offset}) async =>
-      <Map<String, Object?>>[];
+          int? offset}) async {
+    if (table == WKDatabaseMigrator.migrationTable) {
+      return [
+        {'version': whereArgs?.first ?? 202604271625},
+      ];
+    }
+    return <Map<String, Object?>>[];
+  }
 
   @override
   Future<int> insert(String table, Map<String, Object?> values,
@@ -166,6 +176,66 @@ class _HistoryDatabase implements Database {
 
   @override
   Future<void> execute(String sql, [List<Object?>? arguments]) async {}
+
+  @override
+  Future<T> transaction<T>(
+    Future<T> Function(Transaction transaction) action, {
+    bool? exclusive,
+  }) => action(_HistoryTransaction(this));
+
+  @override
+  noSuchMethod(Invocation invocation) => null;
+}
+
+class _HistoryTransaction implements Transaction {
+  _HistoryTransaction(this.database);
+
+  @override
+  final _HistoryDatabase database;
+
+  @override
+  Future<List<Map<String, Object?>>> query(String table,
+          {bool? distinct,
+          List<String>? columns,
+          String? where,
+          List<Object?>? whereArgs,
+          String? groupBy,
+          String? having,
+          String? orderBy,
+          int? limit,
+          int? offset}) =>
+      database.query(
+        table,
+        distinct: distinct,
+        columns: columns,
+        where: where,
+        whereArgs: whereArgs,
+        groupBy: groupBy,
+        having: having,
+        orderBy: orderBy,
+        limit: limit,
+        offset: offset,
+      );
+
+  @override
+  Future<int> insert(String table, Map<String, Object?> values,
+          {String? nullColumnHack,
+          ConflictAlgorithm? conflictAlgorithm}) =>
+      database.insert(
+        table,
+        values,
+        nullColumnHack: nullColumnHack,
+        conflictAlgorithm: conflictAlgorithm,
+      );
+
+  @override
+  Future<void> execute(String sql, [List<Object?>? arguments]) =>
+      database.execute(sql, arguments);
+
+  @override
+  Future<List<Map<String, Object?>>> rawQuery(String sql,
+          [List<Object?>? arguments]) =>
+      database.rawQuery(sql, arguments);
 
   @override
   noSuchMethod(Invocation invocation) => null;
