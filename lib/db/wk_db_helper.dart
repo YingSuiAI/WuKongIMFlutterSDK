@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
 import '../wkim.dart';
+import 'wk_database_migrator.dart';
 
 class WKDBHelper {
   WKDBHelper._privateConstructor();
@@ -11,52 +12,59 @@ class WKDBHelper {
   static WKDBHelper get shared => _instance;
   final dbVersion = 1;
   Database? _database;
-  Future<bool> init() async {
+  Future<bool>? _initialization;
+
+  Future<bool> init() {
+    final active = _initialization;
+    if (active != null) return active;
+    late final Future<bool> attempt;
+    attempt = _openAndMigrate().whenComplete(() {
+      if (identical(_initialization, attempt)) _initialization = null;
+    });
+    _initialization = attempt;
+    return attempt;
+  }
+
+  Future<bool> _openAndMigrate() async {
     var databasesPath = await getDatabasesPath();
     String path = p.join(databasesPath, 'wk_${WKIM.shared.options.uid}.db');
-    _database = await openDatabase(
-      path,
-      version: dbVersion,
-      onCreate: (Database db, int version) async {
-        // onUpgrade(db);
-      },
-      // onUpgrade: (db, oldVersion, newVersion) => {
-      //   onUpgrade(db)},
-    );
-    bool result = await onUpgrade(_database!);
-    return _database != null && result;
+    try {
+      _database = await openDatabase(path, version: dbVersion);
+      bool result = await onUpgrade(_database!);
+      return _database != null && result;
+    } catch (_) {
+      final failedDatabase = _database;
+      _database = null;
+      if (failedDatabase != null) await failedDatabase.close();
+      rethrow;
+    }
   }
 
   Future<bool> onUpgrade(Database db) async {
-    String path = await rootBundle
-        .loadString('packages/wukongimfluttersdk/assets/sql.txt');
+    String path = await rootBundle.loadString(
+      'packages/wukongimfluttersdk/assets/sql.txt',
+    );
     List<String> names = path.split(';');
     SharedPreferences preferences = await SharedPreferences.getInstance();
     String wkUid = WKIM.shared.options.uid!;
     int maxVersion = preferences.getInt('wk_max_sql_version_$wkUid') ?? 0;
-    int saveVersion = 0;
+    final migrations = <int, String>{};
     for (int i = 0; i < names.length; i++) {
       if (names[i] == '') {
         continue;
       }
       int version = int.parse(names[i]);
-      if (version > maxVersion) {
-        String sqlStr = await rootBundle
-            .loadString('packages/wukongimfluttersdk/assets/$version.sql');
-        var sqlList = sqlStr.split(';');
-        for (String sql in sqlList) {
-          String exeSql = sql.replaceAll('\n', '');
-          if (exeSql != '') {
-            await db.execute(exeSql);
-          }
-        }
-        if (version > saveVersion) {
-          saveVersion = version;
-        }
-      }
+      migrations[version] = await rootBundle.loadString(
+        'packages/wukongimfluttersdk/assets/$version.sql',
+      );
     }
-    if (saveVersion > 0) {
-      preferences.setInt('wk_max_sql_version_$wkUid', saveVersion);
+    final appliedVersion = await WKDatabaseMigrator().migrate(
+      db,
+      migrations,
+      legacyMaxVersion: maxVersion,
+    );
+    if (appliedVersion > maxVersion) {
+      await preferences.setInt('wk_max_sql_version_$wkUid', appliedVersion);
     }
     return true;
   }
@@ -66,6 +74,7 @@ class WKDBHelper {
   }
 
   close() {
+    _initialization = null;
     if (_database != null) {
       _database!.close();
       _database = null;

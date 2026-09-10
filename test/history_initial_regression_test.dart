@@ -140,6 +140,9 @@ class _HistoryDatabase implements Database {
   @override
   Future<List<Map<String, Object?>>> rawQuery(String sql,
       [List<Object?>? arguments]) async {
+    if (sql.trimLeft().toUpperCase().startsWith('PRAGMA ')) {
+      return <Map<String, Object?>>[];
+    }
     _rawQueryCount++;
     if (_rawQueryCount == 1) return [_messageRow(1)];
     return [_messageRow(1), _messageRow(2)];
@@ -166,6 +169,66 @@ class _HistoryDatabase implements Database {
 
   @override
   Future<void> execute(String sql, [List<Object?>? arguments]) async {}
+
+  @override
+  Future<T> transaction<T>(
+    Future<T> Function(Transaction transaction) action, {
+    bool? exclusive,
+  }) => action(_HistoryTransaction(this));
+
+  @override
+  noSuchMethod(Invocation invocation) => null;
+}
+
+class _HistoryTransaction implements Transaction {
+  _HistoryTransaction(this.database);
+
+  @override
+  final _HistoryDatabase database;
+
+  @override
+  Future<List<Map<String, Object?>>> query(String table,
+          {bool? distinct,
+          List<String>? columns,
+          String? where,
+          List<Object?>? whereArgs,
+          String? groupBy,
+          String? having,
+          String? orderBy,
+          int? limit,
+          int? offset}) =>
+      database.query(
+        table,
+        distinct: distinct,
+        columns: columns,
+        where: where,
+        whereArgs: whereArgs,
+        groupBy: groupBy,
+        having: having,
+        orderBy: orderBy,
+        limit: limit,
+        offset: offset,
+      );
+
+  @override
+  Future<int> insert(String table, Map<String, Object?> values,
+          {String? nullColumnHack,
+          ConflictAlgorithm? conflictAlgorithm}) =>
+      database.insert(
+        table,
+        values,
+        nullColumnHack: nullColumnHack,
+        conflictAlgorithm: conflictAlgorithm,
+      );
+
+  @override
+  Future<void> execute(String sql, [List<Object?>? arguments]) =>
+      database.execute(sql, arguments);
+
+  @override
+  Future<List<Map<String, Object?>>> rawQuery(String sql,
+          [List<Object?>? arguments]) =>
+      database.rawQuery(sql, arguments);
 
   @override
   noSuchMethod(Invocation invocation) => null;
