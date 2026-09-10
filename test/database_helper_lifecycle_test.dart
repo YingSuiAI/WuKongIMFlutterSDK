@@ -3,9 +3,11 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 // ignore: depend_on_referenced_packages
 import 'package:sqflite_common/src/factory.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wukongimfluttersdk/db/wk_database_migrator.dart';
 import 'package:wukongimfluttersdk/db/wk_db_helper.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
@@ -18,6 +20,7 @@ void main() {
 
   setUp(() async {
     await WKDBHelper.shared.close();
+    SharedPreferences.setMockInitialValues({});
     directory = await Directory.systemTemp.createTemp('wk_helper_');
   });
 
@@ -75,6 +78,76 @@ void main() {
     expect(WKDBHelper.shared.getDB()!.isOpen, isTrue);
     expect(factory.openCount, 2);
   });
+
+  test(
+    'opens a legacy database after adopting its completed watermark',
+    () async {
+      const uid = 'legacy-watermark';
+      const latestVersion = 202604271625;
+      final factory = _ControlledDatabaseFactory(
+        databaseFactoryFfi,
+        directory.path,
+      );
+      databaseFactory = factory;
+      final database = await databaseFactoryFfi.openDatabase(
+        p.join(directory.path, 'wk_$uid.db'),
+      );
+      await WKDatabaseMigrator().migrate(database, await _assetMigrations());
+      await database.execute('DROP TABLE ${WKDatabaseMigrator.migrationTable}');
+      await database.close();
+      SharedPreferences.setMockInitialValues({
+        'wk_max_sql_version_$uid': latestVersion,
+      });
+      WKIM.shared.options.uid = uid;
+
+      expect(await WKDBHelper.shared.init(), isTrue);
+
+      final opened = WKDBHelper.shared.getDB()!;
+      expect(opened.isOpen, isTrue);
+      final versions = await opened.query(
+        WKDatabaseMigrator.migrationTable,
+        columns: const ['version'],
+        orderBy: 'version',
+      );
+      expect(versions.last['version'], latestVersion);
+      expect(versions, hasLength((await _assetMigrations()).length));
+    },
+  );
+
+  test('does not adopt a restored watermark for an empty database', () async {
+    const uid = 'restored-preferences-only';
+    final factory = _ControlledDatabaseFactory(
+      databaseFactoryFfi,
+      directory.path,
+    );
+    databaseFactory = factory;
+    SharedPreferences.setMockInitialValues({
+      'wk_max_sql_version_$uid': 202604271625,
+    });
+    WKIM.shared.options.uid = uid;
+
+    expect(await WKDBHelper.shared.init(), isTrue);
+
+    final opened = WKDBHelper.shared.getDB()!;
+    final tables = await opened.query(
+      'sqlite_master',
+      columns: const ['name'],
+      where: 'type = ? AND name = ?',
+      whereArgs: const ['table', 'message'],
+    );
+    expect(tables, isNotEmpty);
+  });
+}
+
+Future<Map<int, String>> _assetMigrations() async {
+  final versions = (await File('assets/sql.txt').readAsString())
+      .split(';')
+      .where((value) => value.isNotEmpty)
+      .map(int.parse);
+  return {
+    for (final version in versions)
+      version: await File('assets/$version.sql').readAsString(),
+  };
 }
 
 class _ControlledDatabaseFactory extends SqfliteDatabaseFactory {

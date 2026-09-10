@@ -5,12 +5,16 @@ import 'package:sqflite/sqflite.dart';
 class WKDatabaseMigrator {
   static const migrationTable = 'wk_schema_migrations';
 
-  Future<int> migrate(Database database, Map<int, String> migrations) async {
+  Future<int> migrate(
+    Database database,
+    Map<int, String> migrations, {
+    int? legacyAppliedThrough,
+  }) async {
     final versions = migrations.keys.toList()..sort();
 
     // SQLite otherwise fails BEGIN EXCLUSIVE immediately when another SDK
     // connection is completing the same migration.
-    await database.execute('PRAGMA busy_timeout = 10000');
+    await database.rawQuery('PRAGMA busy_timeout = 10000');
     await _exclusiveTransaction(database, (transaction) async {
       await transaction.execute('''
 CREATE TABLE IF NOT EXISTS $migrationTable (
@@ -18,6 +22,17 @@ CREATE TABLE IF NOT EXISTS $migrationTable (
   applied_at INTEGER NOT NULL
 )
 ''');
+      final legacyVersion = legacyAppliedThrough ?? 0;
+      if (legacyVersion > 0) {
+        final appliedAt = DateTime.now().millisecondsSinceEpoch;
+        for (final version in versions) {
+          if (version > legacyVersion) break;
+          await transaction.insert(migrationTable, {
+            'version': version,
+            'applied_at': appliedAt,
+          }, conflictAlgorithm: ConflictAlgorithm.ignore);
+        }
+      }
     });
 
     for (final version in versions) {

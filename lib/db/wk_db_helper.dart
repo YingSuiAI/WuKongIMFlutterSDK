@@ -1,3 +1,4 @@
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
@@ -80,7 +81,7 @@ class WKDBHelper {
     Database? openedDatabase;
     try {
       openedDatabase = await openDatabase(path, version: dbVersion);
-      final result = await onUpgrade(openedDatabase);
+      final result = await onUpgrade(openedDatabase, databaseUid: uid);
       if (!result ||
           generation != _lifecycleGeneration ||
           WKIM.shared.options.uid != uid) {
@@ -100,7 +101,7 @@ class WKDBHelper {
     }
   }
 
-  Future<bool> onUpgrade(Database db) async {
+  Future<bool> onUpgrade(Database db, {String? databaseUid}) async {
     String path = await rootBundle.loadString(
       'packages/wukongimfluttersdk/assets/sql.txt',
     );
@@ -115,8 +116,40 @@ class WKDBHelper {
         'packages/wukongimfluttersdk/assets/$version.sql',
       );
     }
-    await WKDatabaseMigrator().migrate(db, migrations);
+    // Releases before the SQLite migration ledger stored this watermark only
+    // after every migration through it completed successfully. Adopt that
+    // one-way upgrade evidence so an existing database is not replayed as a
+    // fresh one. All later progress remains transactionally owned by SQLite.
+    final preferences = await SharedPreferences.getInstance();
+    final uid = databaseUid ?? WKIM.shared.options.uid!;
+    final legacyWatermark = preferences.getInt('wk_max_sql_version_$uid') ?? 0;
+    final legacyAppliedThrough =
+        legacyWatermark > 0 && await _hasLegacyBaseSchema(db)
+        ? legacyWatermark
+        : 0;
+    await WKDatabaseMigrator().migrate(
+      db,
+      migrations,
+      legacyAppliedThrough: legacyAppliedThrough,
+    );
     return true;
+  }
+
+  Future<bool> _hasLegacyBaseSchema(Database db) async {
+    const baseTables = {
+      'message',
+      'conversation',
+      'channel',
+      'channel_members',
+      'message_reaction',
+    };
+    final rows = await db.query(
+      'sqlite_master',
+      columns: const ['name'],
+      where: "type = 'table'",
+    );
+    final tables = rows.map((row) => row['name']).whereType<String>().toSet();
+    return tables.containsAll(baseTables);
   }
 
   Database? getDB() {

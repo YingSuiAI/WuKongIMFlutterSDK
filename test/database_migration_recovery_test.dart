@@ -26,6 +26,16 @@ void main() {
     expect(await _versions(database), [1, 2]);
   });
 
+  test('configures busy timeout through the query-compatible API', () async {
+    final androidCompatible = _RejectPragmaExecuteDatabase(database);
+
+    await WKDatabaseMigrator().migrate(androidCompatible, {
+      1: 'CREATE TABLE message (id INTEGER PRIMARY KEY);',
+    });
+
+    expect(androidCompatible.busyTimeoutQueries, 1);
+  });
+
   test('rolls back a failed migration and can retry it safely', () async {
     final migrator = WKDatabaseMigrator();
 
@@ -48,6 +58,28 @@ void main() {
     expect(await _tables(database), contains('partial'));
     expect(await _versions(database), [1, 2]);
   });
+
+  test(
+    'adopts a completed legacy watermark before replaying migrations',
+    () async {
+      await database.execute('CREATE TABLE message (id INTEGER PRIMARY KEY)');
+      await database.execute('''
+CREATE TABLE ${WKDatabaseMigrator.migrationTable} (
+  version INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+)
+''');
+
+      final latest = await WKDatabaseMigrator().migrate(database, {
+        1: 'CREATE TABLE message (id INTEGER PRIMARY KEY);',
+        2: 'ALTER TABLE message ADD COLUMN body TEXT;',
+      }, legacyAppliedThrough: 1);
+
+      expect(latest, 2);
+      expect(await _columns(database, 'message'), containsAll(['id', 'body']));
+      expect(await _versions(database), [1, 2]);
+    },
+  );
 
   test('applies the real migration history to a fresh database', () async {
     final migrations = await _assetMigrations();
@@ -128,4 +160,39 @@ Future<Map<int, String>> _assetMigrations() async {
     for (final version in versions)
       version: await File('assets/$version.sql').readAsString(),
   };
+}
+
+class _RejectPragmaExecuteDatabase implements Database {
+  _RejectPragmaExecuteDatabase(this._delegate);
+
+  final Database _delegate;
+  var busyTimeoutQueries = 0;
+
+  @override
+  Future<void> execute(String sql, [List<Object?>? arguments]) {
+    if (sql.trimLeft().toUpperCase().startsWith('PRAGMA')) {
+      throw UnsupportedError('Android requires PRAGMA through rawQuery');
+    }
+    return _delegate.execute(sql, arguments);
+  }
+
+  @override
+  Future<List<Map<String, Object?>>> rawQuery(
+    String sql, [
+    List<Object?>? arguments,
+  ]) {
+    if (sql.trimLeft().toUpperCase().startsWith('PRAGMA BUSY_TIMEOUT')) {
+      busyTimeoutQueries += 1;
+    }
+    return _delegate.rawQuery(sql, arguments);
+  }
+
+  @override
+  Future<T> transaction<T>(
+    Future<T> Function(Transaction txn) action, {
+    bool? exclusive,
+  }) => _delegate.transaction(action, exclusive: exclusive);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
