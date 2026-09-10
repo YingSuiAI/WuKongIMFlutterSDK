@@ -16,6 +16,7 @@ import 'common/options.dart';
 import 'manager/connect_manager.dart';
 import 'manager/event_manager.dart';
 import 'model/wk_card_content.dart';
+import 'proto/proto.dart';
 
 class WKIM {
   WKIM._privateConstructor();
@@ -25,49 +26,63 @@ class WKIM {
   static WKIM get shared => _instance;
   Model runMode = Model.app;
   Options options = Options();
+  int _setupGeneration = 0;
 
   Future<bool> setup(Options opts) async {
-    if (opts.protoVersion >= 6 && !opts.hasExactV6SessionIdentity) {
+    if (opts.protoVersion != currentProtocolVersion ||
+        !opts.hasExactV6SessionIdentity) {
       return false;
     }
+    final generation = ++_setupGeneration;
+    final identity = opts.sessionIdentity;
     options = opts;
     deviceFlagApp = opts.deviceFlag;
     eventManager.reset();
     _initNormalMsgContent();
     if (isApp()) {
-      bool result = await WKDBHelper.shared.init();
-      if (result) {
-        messageManager.updateSendingMsgFail();
+      final result = await WKDBHelper.shared.init();
+      if (!result ||
+          generation != _setupGeneration ||
+          !identical(options, opts) ||
+          options.sessionIdentity != identity) {
+        return false;
       }
-      return result;
+      final database = WKDBHelper.shared.getDB();
+      await messageManager.updateSendingMsgFail();
+      return generation == _setupGeneration &&
+          identical(options, opts) &&
+          options.sessionIdentity == identity &&
+          database != null &&
+          database.isOpen &&
+          identical(database, WKDBHelper.shared.getDB());
     }
     return true;
   }
 
   _initNormalMsgContent() {
-    messageManager.registerMsgContent(WkMessageContentType.text,
-        (dynamic data) {
+    messageManager.registerMsgContent(WkMessageContentType.text, (
+      dynamic data,
+    ) {
       return WKTextContent('').decodeJson(data);
     });
-    messageManager.registerMsgContent(WkMessageContentType.card,
-        (dynamic data) {
+    messageManager.registerMsgContent(WkMessageContentType.card, (
+      dynamic data,
+    ) {
       return WKCardContent('', '').decodeJson(data);
     });
-    messageManager.registerMsgContent(WkMessageContentType.image,
-        (dynamic data) {
-      return WKImageContent(
-        0,
-        0,
-      ).decodeJson(data);
+    messageManager.registerMsgContent(WkMessageContentType.image, (
+      dynamic data,
+    ) {
+      return WKImageContent(0, 0).decodeJson(data);
     });
-    messageManager.registerMsgContent(WkMessageContentType.voice,
-        (dynamic data) {
-      return WKVoiceContent(
-        0,
-      ).decodeJson(data);
+    messageManager.registerMsgContent(WkMessageContentType.voice, (
+      dynamic data,
+    ) {
+      return WKVoiceContent(0).decodeJson(data);
     });
-    messageManager.registerMsgContent(WkMessageContentType.video,
-        (dynamic data) {
+    messageManager.registerMsgContent(WkMessageContentType.video, (
+      dynamic data,
+    ) {
       return WKVideoContent().decodeJson(data);
     });
   }

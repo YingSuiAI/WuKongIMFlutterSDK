@@ -1,4 +1,3 @@
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
@@ -44,7 +43,16 @@ class WKDBHelper {
       if (_initializationGeneration == _lifecycleGeneration) {
         _lifecycleGeneration++;
       }
-      return active.then((_) => init(), onError: (_, __) => init());
+      final generation = _lifecycleGeneration;
+      Future<bool> resume() {
+        if (generation != _lifecycleGeneration ||
+            WKIM.shared.options.uid != uid) {
+          return Future<bool>.value(false);
+        }
+        return init();
+      }
+
+      return active.then((_) => resume(), onError: (_, __) => resume());
     }
 
     if (current != null) {
@@ -81,7 +89,7 @@ class WKDBHelper {
     Database? openedDatabase;
     try {
       openedDatabase = await openDatabase(path, version: dbVersion);
-      final result = await onUpgrade(openedDatabase, databaseUid: uid);
+      final result = await onUpgrade(openedDatabase);
       if (!result ||
           generation != _lifecycleGeneration ||
           WKIM.shared.options.uid != uid) {
@@ -101,7 +109,7 @@ class WKDBHelper {
     }
   }
 
-  Future<bool> onUpgrade(Database db, {String? databaseUid}) async {
+  Future<bool> onUpgrade(Database db) async {
     String path = await rootBundle.loadString(
       'packages/wukongimfluttersdk/assets/sql.txt',
     );
@@ -116,40 +124,8 @@ class WKDBHelper {
         'packages/wukongimfluttersdk/assets/$version.sql',
       );
     }
-    // Releases before the SQLite migration ledger stored this watermark only
-    // after every migration through it completed successfully. Adopt that
-    // one-way upgrade evidence so an existing database is not replayed as a
-    // fresh one. All later progress remains transactionally owned by SQLite.
-    final preferences = await SharedPreferences.getInstance();
-    final uid = databaseUid ?? WKIM.shared.options.uid!;
-    final legacyWatermark = preferences.getInt('wk_max_sql_version_$uid') ?? 0;
-    final legacyAppliedThrough =
-        legacyWatermark > 0 && await _hasLegacyBaseSchema(db)
-        ? legacyWatermark
-        : 0;
-    await WKDatabaseMigrator().migrate(
-      db,
-      migrations,
-      legacyAppliedThrough: legacyAppliedThrough,
-    );
+    await WKDatabaseMigrator().migrate(db, migrations);
     return true;
-  }
-
-  Future<bool> _hasLegacyBaseSchema(Database db) async {
-    const baseTables = {
-      'message',
-      'conversation',
-      'channel',
-      'channel_members',
-      'message_reaction',
-    };
-    final rows = await db.query(
-      'sqlite_master',
-      columns: const ['name'],
-      where: "type = 'table'",
-    );
-    final tables = rows.map((row) => row['name']).whereType<String>().toSet();
-    return tables.containsAll(baseTables);
   }
 
   Database? getDB() {

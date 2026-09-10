@@ -1,7 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+// ignore: implementation_imports, depend_on_referenced_packages
+import 'package:sqflite_common/src/exception.dart';
 import 'package:wukongimfluttersdk/db/wk_database_migrator.dart';
 
 void main() {
@@ -26,14 +29,29 @@ void main() {
     expect(await _versions(database), [1, 2]);
   });
 
-  test('configures busy timeout through the query-compatible API', () async {
-    final androidCompatible = _RejectPragmaExecuteDatabase(database);
+  test(
+    'initializes a fresh Android database with its platform metadata',
+    () async {
+      await database.execute('CREATE TABLE android_metadata (locale TEXT)');
+      await database.insert('android_metadata', {'locale': 'en_US'});
+      await WKDatabaseMigrator().migrate(database, {
+        1: 'CREATE TABLE message (body TEXT);',
+      });
+      expect(await _versions(database), [1]);
+      expect(await database.query('android_metadata'), [
+        {'locale': 'en_US'},
+      ]);
+    },
+  );
+
+  test('does not issue row-returning PRAGMA through Android execute', () async {
+    final androidCompatible = _ObservedDatabase(database);
 
     await WKDatabaseMigrator().migrate(androidCompatible, {
       1: 'CREATE TABLE message (id INTEGER PRIMARY KEY);',
     });
 
-    expect(androidCompatible.busyTimeoutQueries, 1);
+    expect(androidCompatible.pragmaQueries, 0);
   });
 
   test('rolls back a failed migration and can retry it safely', () async {
@@ -59,27 +77,131 @@ void main() {
     expect(await _versions(database), [1, 2]);
   });
 
-  test(
-    'adopts a completed legacy watermark before replaying migrations',
-    () async {
-      await database.execute('CREATE TABLE message (id INTEGER PRIMARY KEY)');
-      await database.execute('''
-CREATE TABLE ${WKDatabaseMigrator.migrationTable} (
-  version INTEGER PRIMARY KEY,
-  applied_at INTEGER NOT NULL
-)
-''');
+  test('does not infer migration progress from an untracked schema', () async {
+    await database.execute('CREATE TABLE message (body TEXT)');
+    await database.insert('message', {'body': 'keep'});
 
-      final latest = await WKDatabaseMigrator().migrate(database, {
-        1: 'CREATE TABLE message (id INTEGER PRIMARY KEY);',
-        2: 'ALTER TABLE message ADD COLUMN body TEXT;',
-      }, legacyAppliedThrough: 1);
+    await expectLater(
+      WKDatabaseMigrator().migrate(database, {
+        1: 'CREATE TABLE IF NOT EXISTS message (body TEXT);',
+        2: 'DELETE FROM message;',
+      }),
+      throwsStateError,
+    );
 
-      expect(latest, 2);
-      expect(await _columns(database, 'message'), containsAll(['id', 'body']));
-      expect(await _versions(database), [1, 2]);
-    },
-  );
+    expect(await database.query('message'), [
+      {'body': 'keep'},
+    ]);
+    expect(
+      await _tables(database),
+      isNot(contains(WKDatabaseMigrator.migrationTable)),
+    );
+  });
+
+  test('reopens the current ledger without replaying data changes', () async {
+    final migrations = {
+      1: "CREATE TABLE message (body TEXT); INSERT INTO message VALUES ('once');",
+      2: 'ALTER TABLE message ADD COLUMN extra TEXT;',
+    };
+    await WKDatabaseMigrator().migrate(database, migrations);
+    await WKDatabaseMigrator().migrate(database, migrations);
+    expect(await database.query('message'), [
+      {'body': 'once', 'extra': null},
+    ]);
+    expect(await _versions(database), [1, 2]);
+  });
+
+  test('rejects empty migrations before writing a ledger', () async {
+    await expectLater(
+      WKDatabaseMigrator().migrate(database, {1: ' ; '}),
+      throwsStateError,
+    );
+    expect(await _tables(database), isEmpty);
+  });
+
+  test('rejects a ledger which is not a prefix of this catalog', () async {
+    await WKDatabaseMigrator().migrate(database, {
+      2: 'CREATE TABLE message (body TEXT);',
+    });
+    await expectLater(
+      WKDatabaseMigrator().migrate(database, {
+        1: 'DROP TABLE message;',
+        2: 'CREATE TABLE message (body TEXT);',
+      }),
+      throwsStateError,
+    );
+    expect(await _tables(database), contains('message'));
+    expect(await _versions(database), [2]);
+  });
+
+  for (final code in [5, 6, 261, 262]) {
+    test('retries Android lock acquisition result $code', () async {
+      final observed = _ObservedDatabase(
+        database,
+        failures: [
+          SqfliteDatabaseException(
+            'database is locked (code $code SQLITE_BUSY)',
+            null,
+          ),
+        ],
+      );
+      await WKDatabaseMigrator().migrate(observed, {
+        1: 'CREATE TABLE message (body TEXT);',
+      });
+      expect(observed.attempts, 3);
+      expect(await _versions(database), [1]);
+    });
+  }
+
+  test('stops after bounded lock acquisition attempts', () async {
+    final locked = SqfliteDatabaseException(
+      'database is locked (code 5 SQLITE_BUSY)',
+      null,
+    );
+    final observed = _ObservedDatabase(
+      database,
+      failures: List.filled(20, locked),
+    );
+    await expectLater(
+      WKDatabaseMigrator().migrate(observed, {
+        1: 'CREATE TABLE message (body TEXT);',
+      }),
+      throwsA(same(locked)),
+    );
+    expect(observed.attempts, 8);
+    expect(await _tables(database), isEmpty);
+  });
+
+  test('does not retry non-lock database failures', () async {
+    final failure = SqfliteDatabaseException(
+      'syntax error (code 1 SQLITE_ERROR)',
+      null,
+    );
+    final observed = _ObservedDatabase(database, failures: [failure]);
+    await expectLater(
+      WKDatabaseMigrator().migrate(observed, {
+        1: 'CREATE TABLE message (body TEXT);',
+      }),
+      throwsA(same(failure)),
+    );
+    expect(observed.attempts, 1);
+  });
+
+  test('does not replay after the transaction action has started', () async {
+    final failure = SqfliteDatabaseException(
+      'database is locked (code 5 SQLITE_BUSY)',
+      null,
+    );
+    final observed = _ObservedDatabase(database, afterActionFailure: failure);
+    await expectLater(
+      WKDatabaseMigrator().migrate(observed, {
+        1: 'CREATE TABLE message (body TEXT);',
+      }),
+      throwsA(same(failure)),
+    );
+    expect(observed.attempts, 1);
+    expect(await _tables(database), isEmpty);
+  });
 
   test('applies the real migration history to a fresh database', () async {
     final migrations = await _assetMigrations();
@@ -102,6 +224,8 @@ CREATE TABLE ${WKDatabaseMigrator.migrationTable} (
       path,
       options: options,
     );
+    final releaseLock = Completer<void>();
+    Future<void>? blocker;
     try {
       final migrations = {
         1: '''
@@ -110,9 +234,20 @@ INSERT INTO event (id, value) VALUES (1, 'once');
 ''',
       };
 
+      final lockHeld = Completer<void>();
+      blocker = first.transaction((transaction) async {
+        lockHeld.complete();
+        await releaseLock.future;
+      }, exclusive: true);
+      await lockHeld.future;
+      final observed = _ObservedDatabase(second);
+      final pending = WKDatabaseMigrator().migrate(observed, migrations);
+      await observed.lockFailure.future.timeout(const Duration(seconds: 5));
+      releaseLock.complete();
+      await blocker;
       await Future.wait([
         WKDatabaseMigrator().migrate(first, migrations),
-        WKDatabaseMigrator().migrate(second, migrations),
+        pending,
       ]);
 
       expect(await first.query('event'), [
@@ -120,6 +255,8 @@ INSERT INTO event (id, value) VALUES (1, 'once');
       ]);
       expect(await _versions(first), [1]);
     } finally {
+      if (!releaseLock.isCompleted) releaseLock.complete();
+      await blocker;
       await first.close();
       await second.close();
       await directory.delete(recursive: true);
@@ -162,11 +299,19 @@ Future<Map<int, String>> _assetMigrations() async {
   };
 }
 
-class _RejectPragmaExecuteDatabase implements Database {
-  _RejectPragmaExecuteDatabase(this._delegate);
+class _ObservedDatabase implements Database {
+  _ObservedDatabase(
+    this._delegate, {
+    List<DatabaseException>? failures,
+    this.afterActionFailure,
+  }) : failures = [...?failures];
 
   final Database _delegate;
-  var busyTimeoutQueries = 0;
+  final List<DatabaseException> failures;
+  final DatabaseException? afterActionFailure;
+  final lockFailure = Completer<void>();
+  var pragmaQueries = 0;
+  var attempts = 0;
 
   @override
   Future<void> execute(String sql, [List<Object?>? arguments]) {
@@ -181,8 +326,8 @@ class _RejectPragmaExecuteDatabase implements Database {
     String sql, [
     List<Object?>? arguments,
   ]) {
-    if (sql.trimLeft().toUpperCase().startsWith('PRAGMA BUSY_TIMEOUT')) {
-      busyTimeoutQueries += 1;
+    if (sql.trimLeft().toUpperCase().startsWith('PRAGMA')) {
+      pragmaQueries += 1;
     }
     return _delegate.rawQuery(sql, arguments);
   }
@@ -191,7 +336,24 @@ class _RejectPragmaExecuteDatabase implements Database {
   Future<T> transaction<T>(
     Future<T> Function(Transaction txn) action, {
     bool? exclusive,
-  }) => _delegate.transaction(action, exclusive: exclusive);
+  }) async {
+    expect(exclusive, isTrue);
+    attempts++;
+    if (failures.isNotEmpty) throw failures.removeAt(0);
+    try {
+      return await _delegate.transaction((transaction) async {
+        final result = await action(transaction);
+        if (afterActionFailure != null) throw afterActionFailure!;
+        return result;
+      }, exclusive: exclusive);
+    } on DatabaseException catch (error) {
+      final code = error.getResultCode();
+      if (code != null && (code & 0xff) == 5 && !lockFailure.isCompleted) {
+        lockFailure.complete();
+      }
+      rethrow;
+    }
+  }
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);

@@ -1,7 +1,6 @@
 import 'dart:convert';
 
 import 'package:wukongimfluttersdk/common/crypto_utils.dart';
-import 'package:wukongimfluttersdk/wkim.dart';
 
 import 'proto.dart';
 
@@ -11,6 +10,7 @@ class PacketHeader {
   bool showUnread = false; // 是否显示未读红点
   bool noPersist = false; // 是否不存储
   bool syncOnce = false; // 是否只同步一次
+  bool dup = false; // 服务端重投或客户端重发标志
   int remainingLength = 0;
   bool hasServerVersion = false; // 是否有服务端版本
 }
@@ -30,17 +30,18 @@ class ConnectPacket extends Packet {
   int clientTimestamp;
   String uid;
   String token;
-  ConnectPacket(
-      {this.version = 0,
-      this.clientKey = "",
-      this.deviceID = "",
-      this.appInstanceID = "",
-      this.installationGeneration = 0,
-      this.sessionGeneration = 0,
-      this.clientTimestamp = 0,
-      this.deviceFlag = 0,
-      this.uid = "",
-      this.token = ""}) {
+  ConnectPacket({
+    this.version = currentProtocolVersion,
+    this.clientKey = "",
+    this.deviceID = "",
+    this.appInstanceID = "",
+    this.installationGeneration = 0,
+    this.sessionGeneration = 0,
+    this.clientTimestamp = 0,
+    this.deviceFlag = 0,
+    this.uid = "",
+    this.token = "",
+  }) {
     header.packetType = PacketType.connect;
   }
   @override
@@ -54,7 +55,7 @@ class ConnackPacket extends Packet {
   String salt;
   int timeDiff;
   int reasonCode;
-  int serviceProtoVersion = WKIM.shared.options.protoVersion;
+  int serviceProtoVersion = currentProtocolVersion;
   int nodeId = 0;
   ConnackPacket({
     this.serverKey = "",
@@ -83,8 +84,9 @@ class SendPacket extends Packet {
     header.packetType = PacketType.send;
   }
 
-  String encodeMsgKey() {
-    String content = encodeMsgContent();
+  String encodeMsgKey({String? encodedContent}) {
+    if (setting.noEncrypt == 1) return '';
+    String content = encodedContent ?? encodeMsgContent();
     StringBuffer sb = StringBuffer();
     sb.write(clientSeq);
     sb.write(clientMsgNO);
@@ -96,6 +98,7 @@ class SendPacket extends Packet {
   }
 
   String encodeMsgContent() {
+    if (setting.noEncrypt == 1) return payload;
     return CryptoUtils.aesEncrypt(payload);
   }
 }
@@ -114,9 +117,7 @@ class SendAckPacket extends Packet {
 class RecvAckPacket extends Packet {
   BigInt messageID = BigInt.from(0);
   int messageSeq;
-  RecvAckPacket({
-    this.messageSeq = 0,
-  }) {
+  RecvAckPacket({this.messageSeq = 0}) {
     header.packetType = PacketType.recvack;
   }
 }
@@ -136,7 +137,8 @@ class RecvPacket extends Packet {
   int expire = 0;
   @override
   String toString() {
-    return "msgkey：$msgKey，chanenlID：$channelID，channelType：$channelType，fromUID：$fromUID，clientMsgNO：$clientMsgNO，messageID：$messageID，messageSeq：$messageSeq，messageTime：$messageTime，payload：$payload";
+    return 'RecvPacket(messageID: $messageID, messageSeq: $messageSeq, '
+        'messageTime: $messageTime, channelType: $channelType)';
   }
 }
 

@@ -22,98 +22,135 @@ class MessageDB {
   final String messageCols =
       "${WKDBConst.tableMessage}.client_seq,${WKDBConst.tableMessage}.message_id,${WKDBConst.tableMessage}.message_seq,${WKDBConst.tableMessage}.channel_id,${WKDBConst.tableMessage}.channel_type,${WKDBConst.tableMessage}.timestamp,${WKDBConst.tableMessage}.topic_id,${WKDBConst.tableMessage}.from_uid,${WKDBConst.tableMessage}.type,${WKDBConst.tableMessage}.content,${WKDBConst.tableMessage}.status,${WKDBConst.tableMessage}.voice_status,${WKDBConst.tableMessage}.created_at,${WKDBConst.tableMessage}.updated_at,${WKDBConst.tableMessage}.searchable_word,${WKDBConst.tableMessage}.client_msg_no,${WKDBConst.tableMessage}.setting,${WKDBConst.tableMessage}.order_seq,${WKDBConst.tableMessage}.extra,${WKDBConst.tableMessage}.is_deleted,${WKDBConst.tableMessage}.flame,${WKDBConst.tableMessage}.flame_second,${WKDBConst.tableMessage}.viewed,${WKDBConst.tableMessage}.viewed_at,${WKDBConst.tableMessage}.expire_time,${WKDBConst.tableMessage}.expire_timestamp";
 
-  Future<bool> isExist(String clientMsgNo) async {
+  Future<bool> isExist(String clientMsgNo, {DatabaseExecutor? database}) async {
+    final db = database ?? WKDBHelper.shared.getDB();
     bool isExist = false;
-    if (WKDBHelper.shared.getDB() == null) {
+    if (db == null) {
       return isExist;
     }
-    List<Map<String, Object?>> list = await WKDBHelper.shared.getDB()!.query(
-        WKDBConst.tableMessage,
-        where: "client_msg_no=?",
-        whereArgs: [clientMsgNo]);
+    List<Map<String, Object?>> list = await db.query(
+      WKDBConst.tableMessage,
+      where: "client_msg_no=?",
+      whereArgs: [clientMsgNo],
+    );
     if (list.isNotEmpty) {
       isExist = true;
     }
     return isExist;
   }
 
-  Future<int> insert(WKMsg msg) async {
+  Future<int> insert(WKMsg msg, {DatabaseExecutor? database}) async {
+    final db = database ?? WKDBHelper.shared.getDB();
+    if (db == null) throw StateError('Message database is not open.');
     if (msg.clientSeq != 0) {
-      updateMsg(msg);
+      await updateMsg(msg, database: db);
       return msg.clientSeq;
     }
     if (msg.clientMsgNO != '') {
-      bool exist = await isExist(msg.clientMsgNO);
+      bool exist = await isExist(msg.clientMsgNO, database: db);
       if (exist) {
         msg.isDeleted = 1;
         msg.clientMsgNO = WKIM.shared.messageManager.generateClientMsgNo();
       }
     }
-    return await WKDBHelper.shared.getDB()!.insert(
-        WKDBConst.tableMessage, getMap(msg),
-        conflictAlgorithm: ConflictAlgorithm.replace);
+    return await db.insert(
+      WKDBConst.tableMessage,
+      getMap(msg),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
   }
 
-  Future<int> updateMsg(WKMsg msg) async {
-    if (WKDBHelper.shared.getDB() == null) {
+  Future<int> updateMsg(WKMsg msg, {DatabaseExecutor? database}) async {
+    final db = database ?? WKDBHelper.shared.getDB();
+    if (db == null) {
       return 0;
     }
-    return await WKDBHelper.shared.getDB()!.update(
-        WKDBConst.tableMessage, getMap(msg),
-        where: "client_seq=?", whereArgs: [msg.clientSeq]);
+    return await db.update(
+      WKDBConst.tableMessage,
+      getMap(msg),
+      where: "client_seq=?",
+      whereArgs: [msg.clientSeq],
+    );
   }
 
-  Future<int> updateMsgWithField(dynamic map, int clientSeq) async {
-    if (WKDBHelper.shared.getDB() == null) {
+  Future<int> updateMsgWithField(
+    dynamic map,
+    int clientSeq, {
+    DatabaseExecutor? database,
+  }) async {
+    final db = database ?? WKDBHelper.shared.getDB();
+    if (db == null) {
       return 0;
     }
-    return await WKDBHelper.shared.getDB()!.update(WKDBConst.tableMessage, map,
-        where: "client_seq=?", whereArgs: [clientSeq]);
+    return await db.update(
+      WKDBConst.tableMessage,
+      map,
+      where: "client_seq=?",
+      whereArgs: [clientSeq],
+    );
   }
 
   Future<int> updateMsgWithFieldAndClientMsgNo(
-      dynamic map, String clientMsgNO) async {
-    if (WKDBHelper.shared.getDB() == null) {
+    dynamic map,
+    String clientMsgNO, {
+    DatabaseExecutor? database,
+  }) async {
+    final db = database ?? WKDBHelper.shared.getDB();
+    if (db == null) {
       return 0;
     }
-    return await WKDBHelper.shared.getDB()!.update(WKDBConst.tableMessage, map,
-        where: "client_msg_no=?", whereArgs: [clientMsgNO]);
+    return await db.update(
+      WKDBConst.tableMessage,
+      map,
+      where: "client_msg_no=?",
+      whereArgs: [clientMsgNO],
+    );
   }
 
-  Future<WKMsg?> queryWithClientMsgNo(String clientMsgNo) async {
+  Future<WKMsg?> queryWithClientMsgNo(
+    String clientMsgNo, {
+    DatabaseExecutor? database,
+  }) async {
+    final db = database ?? WKDBHelper.shared.getDB();
     WKMsg? wkMsg;
     String sql =
         "select $messageCols,$extraCols from ${WKDBConst.tableMessage} LEFT JOIN ${WKDBConst.tableMessageExtra} ON ${WKDBConst.tableMessage}.message_id=${WKDBConst.tableMessageExtra}.message_id WHERE ${WKDBConst.tableMessage}.client_msg_no=?";
-    if (WKDBHelper.shared.getDB() == null) {
+    if (db == null) {
       return wkMsg;
     }
-    List<Map<String, Object?>> list =
-        await WKDBHelper.shared.getDB()!.rawQuery(sql, [clientMsgNo]);
+    List<Map<String, Object?>> list = await db.rawQuery(sql, [clientMsgNo]);
     if (list.isNotEmpty) {
       wkMsg = WKDBConst.serializeWKMsg(list[0]);
     }
     if (wkMsg != null) {
-      wkMsg.reactionList =
-          await ReactionDB.shared.queryWithMessageId(wkMsg.messageID);
+      wkMsg.reactionList = await ReactionDB.shared.queryWithMessageId(
+        wkMsg.messageID,
+        database: db,
+      );
     }
     return wkMsg;
   }
 
-  Future<WKMsg?> queryWithClientSeq(int clientSeq) async {
+  Future<WKMsg?> queryWithClientSeq(
+    int clientSeq, {
+    DatabaseExecutor? database,
+  }) async {
+    final db = database ?? WKDBHelper.shared.getDB();
     WKMsg? wkMsg;
     String sql =
         "select $messageCols,$extraCols from ${WKDBConst.tableMessage} LEFT JOIN ${WKDBConst.tableMessageExtra} ON ${WKDBConst.tableMessage}.message_id=${WKDBConst.tableMessageExtra}.message_id WHERE ${WKDBConst.tableMessage}.client_seq=?";
-    if (WKDBHelper.shared.getDB() == null) {
+    if (db == null) {
       return wkMsg;
     }
-    List<Map<String, Object?>> list =
-        await WKDBHelper.shared.getDB()!.rawQuery(sql, [clientSeq]);
+    List<Map<String, Object?>> list = await db.rawQuery(sql, [clientSeq]);
     if (list.isNotEmpty) {
       wkMsg = WKDBConst.serializeWKMsg(list[0]);
     }
     if (wkMsg != null) {
-      wkMsg.reactionList =
-          await ReactionDB.shared.queryWithMessageId(wkMsg.messageID);
+      wkMsg.reactionList = await ReactionDB.shared.queryWithMessageId(
+        wkMsg.messageID,
+        database: db,
+      );
     }
     return wkMsg;
   }
@@ -135,16 +172,22 @@ class MessageDB {
     return list;
   }
 
-  Future<int> queryMaxOrderSeq(String channelID, int channelType) async {
+  Future<int> queryMaxOrderSeq(
+    String channelID,
+    int channelType, {
+    DatabaseExecutor? database,
+  }) async {
+    final db = database ?? WKDBHelper.shared.getDB();
     int maxOrderSeq = 0;
-    if (WKDBHelper.shared.getDB() == null) {
+    if (db == null) {
       return maxOrderSeq;
     }
     String sql =
         "select max(order_seq) order_seq from ${WKDBConst.tableMessage} where channel_id =? and channel_type=? and type<>99 and type<>0 and is_deleted=0";
-    List<Map<String, Object?>> list = await WKDBHelper.shared
-        .getDB()!
-        .rawQuery(sql, [channelID, channelType]);
+    List<Map<String, Object?>> list = await db.rawQuery(sql, [
+      channelID,
+      channelType,
+    ]);
     if (list.isNotEmpty) {
       dynamic data = list[0];
       maxOrderSeq = WKDBConst.readInt(data, 'order_seq');
@@ -771,15 +814,14 @@ class MessageDB {
     return list;
   }
 
-  updateSendingMsgFail() {
-    if (WKDBHelper.shared.getDB() == null) {
+  Future<void> updateSendingMsgFail() async {
+    final db = WKDBHelper.shared.getDB();
+    if (db == null) {
       return;
     }
     var map = <String, Object>{};
     map['status'] = WKSendMsgResult.sendFail;
-    WKDBHelper.shared
-        .getDB()!
-        .update(WKDBConst.tableMessage, map, where: 'status=0');
+    await db.update(WKDBConst.tableMessage, map, where: 'status=0');
   }
 
   Future<WKMsg?> queryMaxOrderSeqMsgWithChannel(

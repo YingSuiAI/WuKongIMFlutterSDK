@@ -196,18 +196,26 @@ class ConversationDB {
   }
 
   Future<WKUIConversationMsg?> insertOrUpdateWithConvMsg(
-      WKConversationMsg conversationMsg) async {
-    if (WKDBHelper.shared.getDB() == null) {
+    WKConversationMsg conversationMsg, {
+    DatabaseExecutor? database,
+  }) async {
+    final db = database ?? WKDBHelper.shared.getDB();
+    if (db == null) {
       return null;
     }
     int row;
     WKConversationMsg? lastMsg = await queryMsgByMsgChannelId(
-        conversationMsg.channelID, conversationMsg.channelType);
+      conversationMsg.channelID,
+      conversationMsg.channelType,
+      database: db,
+    );
 
     if (lastMsg == null || lastMsg.channelID.isEmpty) {
-      row = await WKDBHelper.shared.getDB()!.insert(
-          WKDBConst.tableConversation, getMap(conversationMsg, false),
-          conflictAlgorithm: ConflictAlgorithm.replace);
+      row = await db.insert(
+        WKDBConst.tableConversation,
+        getMap(conversationMsg, false),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
     } else {
       // 这里有错误数据，需要清理
       var len = lastMsg.localExtraMap?.toString().length ?? 0;
@@ -216,10 +224,12 @@ class ConversationDB {
       }
       conversationMsg.unreadCount =
           lastMsg.unreadCount + conversationMsg.unreadCount;
-      row = await WKDBHelper.shared.getDB()!.update(
-          WKDBConst.tableConversation, getMap(conversationMsg, false),
-          where: "channel_id=? and channel_type=?",
-          whereArgs: [conversationMsg.channelID, conversationMsg.channelType]);
+      row = await db.update(
+        WKDBConst.tableConversation,
+        getMap(conversationMsg, false),
+        where: "channel_id=? and channel_type=?",
+        whereArgs: [conversationMsg.channelID, conversationMsg.channelType],
+      );
     }
     if (row > 0) {
       return getUIMsg(conversationMsg);
@@ -228,15 +238,20 @@ class ConversationDB {
   }
 
   Future<WKConversationMsg?> queryMsgByMsgChannelId(
-      String channelId, int channelType) async {
+    String channelId,
+    int channelType, {
+    DatabaseExecutor? database,
+  }) async {
+    final db = database ?? WKDBHelper.shared.getDB();
     WKConversationMsg? msg;
-    if (WKDBHelper.shared.getDB() == null) {
+    if (db == null) {
       return msg;
     }
-    List<Map<String, Object?>> list = await WKDBHelper.shared.getDB()!.query(
-        WKDBConst.tableConversation,
-        where: "channel_id=? and channel_type=?",
-        whereArgs: [channelId, channelType]);
+    List<Map<String, Object?>> list = await db.query(
+      WKDBConst.tableConversation,
+      where: "channel_id=? and channel_type=?",
+      whereArgs: [channelId, channelType],
+    );
     if (list.isNotEmpty) {
       msg = WKDBConst.serializeCoversation(list[0]);
     }

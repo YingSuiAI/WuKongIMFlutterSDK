@@ -1,44 +1,20 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter/services.dart';
 import 'package:wukongimfluttersdk/common/mode.dart';
 import 'package:wukongimfluttersdk/common/options.dart';
 import 'package:wukongimfluttersdk/common/crypto_utils.dart';
 import 'package:wukongimfluttersdk/entity/msg.dart';
+import 'package:wukongimfluttersdk/proto/write_read.dart';
+import 'package:wukongimfluttersdk/proto/proto.dart';
+import 'package:wukongimfluttersdk/type/const.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
-  Completer<void>? holdPreferences;
-  Completer<void>? preferencesRequested;
-  const preferencesChannel =
-      MethodChannel('plugins.flutter.io/shared_preferences');
-  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-      .setMockMethodCallHandler(preferencesChannel, (call) async {
-    if (call.method == 'getAll' || call.method == 'setString') {
-      if (preferencesRequested != null && !preferencesRequested!.isCompleted) {
-        preferencesRequested!.complete();
-      }
-      final hold = holdPreferences;
-      if (hold != null) {
-        await hold.future;
-      }
-      if (call.method == 'getAll') {
-        return <String, Object>{};
-      }
-      return true;
-    }
-    if (call.method == 'setBool' ||
-        call.method == 'setInt' ||
-        call.method == 'setDouble' ||
-        call.method == 'setStringList' ||
-        call.method == 'remove') {
-      return true;
-    }
-    return null;
-  });
   late ServerSocket server;
   final clients = <Socket>[];
   final receivedBytes = <Socket, int>{};
@@ -55,18 +31,17 @@ void main() {
         receivedBytes[socket] = receivedBytes[socket]! + data.length;
       }, onDone: () {});
     });
-    holdPreferences = null;
-    preferencesRequested = null;
     WKIM.shared.runMode = Model.web;
-    WKIM.shared.options = Options.newDefault(
-      'lifecycle-test-user-$testIndex',
-      'lifecycle-test-token',
-      addr: '127.0.0.1:${server.port}',
-    )
-      ..installationID = 'lifecycle-installation-$testIndex'
-      ..appInstanceID = 'lifecycle-app-instance-$testIndex'
-      ..installationGeneration = testIndex
-      ..sessionGeneration = testIndex;
+    WKIM.shared.options =
+        Options.newDefault(
+            'lifecycle-test-user-$testIndex',
+            'lifecycle-test-token',
+            addr: '127.0.0.1:${server.port}',
+          )
+          ..installationID = 'lifecycle-installation-$testIndex'
+          ..appInstanceID = 'lifecycle-app-instance-$testIndex'
+          ..installationGeneration = testIndex
+          ..sessionGeneration = testIndex;
     WKIM.shared.connectionManager.disconnect(false);
   });
 
@@ -82,43 +57,86 @@ void main() {
     readSubscriptions.clear();
   });
 
-  test('serializes concurrent sends and tolerates close during flush',
-      () async {
-    WKIM.shared.connectionManager.connect();
-    await _eventually(() => clients.isNotEmpty);
-    readSubscriptions[clients.single]!.pause();
-    CryptoUtils.aesKey = '0123456789abcdef';
-    CryptoUtils.salt = '1234567890123456';
-    final payload = 'x' * 32768;
+  test(
+    'serializes concurrent sends and tolerates close during flush',
+    () async {
+      WKIM.shared.connectionManager.connect();
+      await _eventually(() => clients.isNotEmpty);
+      await _eventually(() => receivedBytes[clients.single]! > 0);
+      final authenticated = Completer<void>();
+      WKIM.shared.connectionManager.addOnConnectionStatus('flush-test', (
+        status,
+        _,
+        _,
+      ) {
+        if (status == WKConnectStatus.success && !authenticated.isCompleted) {
+          authenticated.complete();
+        }
+      });
+      final connack = WriteData()
+        ..writeUint8(6)
+        ..writeUint64(BigInt.zero)
+        ..writeUint8(1)
+        ..writeString(base64Encode(CryptoUtils.dhPublicKey!))
+        ..writeString('1234567890123456')
+        ..writeUint64(BigInt.zero);
+      clients.single.add([
+        0x21,
+        ...encodeVariableLength(connack.data.length),
+        ...connack.data,
+      ]);
+      await authenticated.future;
+      WKIM.shared.connectionManager.removeOnConnectionStatus('flush-test');
+      readSubscriptions[clients.single]!.pause();
+      CryptoUtils.aesKey = '0123456789abcdef';
+      CryptoUtils.salt = '1234567890123456';
+      final payload = 'x' * 32768;
+      final sends = <Future<void>>[];
+      final failures = <Object>[];
 
-    for (var i = 0; i < 64; i++) {
-      final msg = WKMsg()
-        ..clientSeq = i + 1
-        ..channelID = 'peer'
-        ..channelType = 1
-        ..content = '{"content":"$payload"}'
-        ..header.noPersist = true;
-      WKIM.shared.connectionManager.sendMessage(msg);
-    }
-    WKIM.shared.connectionManager.disconnect(false);
-    WKIM.shared.connectionManager.disconnect(false);
-    await Future<void>.delayed(const Duration(milliseconds: 100));
-  });
+      for (var i = 0; i < 64; i++) {
+        final msg = WKMsg()
+          ..fromUID = WKIM.shared.options.uid!
+          ..clientSeq = i + 1
+          ..channelID = 'peer'
+          ..channelType = 1
+          ..content = '{"content":"$payload"}'
+          ..header.noPersist = true;
+        sends.add(
+          WKIM.shared.connectionManager
+              .sendMessage(msg)
+              .then<void>(
+                (_) {},
+                onError: (Object error, StackTrace stack) {
+                  failures.add(error);
+                },
+              ),
+        );
+      }
+      WKIM.shared.connectionManager.disconnect(false);
+      WKIM.shared.connectionManager.disconnect(false);
+      await Future.wait(sends);
+      expect(failures, isNotEmpty);
+    },
+  );
 
   test(
-      'remote close schedules one reconnect, intentional disconnect cancels it',
-      () async {
-    WKIM.shared.connectionManager.connect();
-    await _eventually(() => clients.length == 1);
-    clients.single.destroy();
-    await _eventually(() => clients.length == 2,
-        timeout: const Duration(seconds: 3));
+    'remote close schedules one reconnect, intentional disconnect cancels it',
+    () async {
+      WKIM.shared.connectionManager.connect();
+      await _eventually(() => clients.length == 1);
+      clients.single.destroy();
+      await _eventually(
+        () => clients.length == 2,
+        timeout: const Duration(seconds: 3),
+      );
 
-    WKIM.shared.connectionManager.disconnect(false);
-    clients.last.destroy();
-    await Future<void>.delayed(const Duration(milliseconds: 1700));
-    expect(clients.length, 2);
-  });
+      WKIM.shared.connectionManager.disconnect(false);
+      clients.last.destroy();
+      await Future<void>.delayed(const Duration(milliseconds: 1700));
+      expect(clients.length, 2);
+    },
+  );
 
   test('disconnect resets network gate for a fresh connection', () async {
     final manager = WKIM.shared.connectionManager;
@@ -151,19 +169,14 @@ void main() {
     expect(identical(WKIM.shared.options, previous), isTrue);
   });
 
-  test('old delayed handshake does not write after disconnect', () async {
-    WKIM.shared.options.protoVersion = 5;
-    WKIM.shared.options.installationID = null;
-    holdPreferences = Completer<void>();
-    preferencesRequested = Completer<void>();
+  test('delayed address lookup cannot connect a replacement session', () async {
+    void Function(String)? completeAddress;
+    WKIM.shared.options.getAddr = (complete) => completeAddress = complete;
     WKIM.shared.connectionManager.connect();
-    await _eventually(() => clients.length == 1);
-    await preferencesRequested!.future;
-    final bytesBeforeDisconnect = receivedBytes[clients.single]!;
-    WKIM.shared.connectionManager.disconnect(false);
-    holdPreferences!.complete();
+    WKIM.shared.options.sessionGeneration++;
+    completeAddress!('127.0.0.1:${server.port}');
     await Future<void>.delayed(const Duration(milliseconds: 100));
-    expect(receivedBytes[clients.single], bytesBeforeDisconnect);
+    expect(clients, isEmpty);
   });
 
   test('late address callback is ignored after disconnect', () async {
@@ -183,8 +196,10 @@ void main() {
   });
 }
 
-Future<void> _eventually(bool Function() condition,
-    {Duration timeout = const Duration(seconds: 1)}) async {
+Future<void> _eventually(
+  bool Function() condition, {
+  Duration timeout = const Duration(seconds: 1),
+}) async {
   final deadline = DateTime.now().add(timeout);
   while (!condition()) {
     if (DateTime.now().isAfter(deadline)) {

@@ -11,11 +11,24 @@ class Options {
   int sessionGeneration = 0;
   bool debug = true;
   Function(Function(String addr) complete)?
-      getAddr; // async get connect address
+  getAddr; // async get connect address
   Proto proto = Proto();
   Options();
 
   Options.newDefault(this.uid, this.token, {this.addr});
+
+  /// Immutable identity captured before asynchronous work starts. Endpoint and
+  /// debug settings do not change the authenticated owner of that work.
+  Object get sessionIdentity => (
+    uid,
+    token,
+    protoVersion,
+    deviceFlag,
+    installationID,
+    appInstanceID,
+    installationGeneration,
+    sessionGeneration,
+  );
 
   bool get hasExactV6SessionIdentity =>
       installationID != null &&

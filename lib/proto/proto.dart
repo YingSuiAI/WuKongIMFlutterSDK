@@ -1,11 +1,10 @@
-import 'dart:math';
+import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:wukongimfluttersdk/wkim.dart';
-
-import '../common/logs.dart';
 import 'packet.dart';
 import 'write_read.dart';
+
+const currentProtocolVersion = 6;
 
 enum PacketType {
   reserved, // 保留位
@@ -27,14 +26,18 @@ enum PacketType {
 class Setting {
   int receipt = 0;
   int topic = 0;
+  int noEncrypt = 0;
+  int _otherBits = 0;
   Setting decode(int v) {
     receipt = (v >> 7 & 0x01);
     topic = (v >> 3 & 0x01);
+    noEncrypt = (v >> 4 & 0x01);
+    _otherBits = v & 0x67;
     return this;
   }
 
   int encode() {
-    return receipt << 7 | topic << 3;
+    return _otherBits | receipt << 7 | topic << 3 | noEncrypt << 4;
   }
 }
 
@@ -57,7 +60,10 @@ class Proto {
     if (packet.header.packetType != PacketType.ping &&
         packet.header.packetType != PacketType.pong) {
       var packetEncodeFunc = packetEncodeMap[packet.header.packetType];
-      var body = packetEncodeFunc!(packet);
+      if (packetEncodeFunc == null) {
+        throw UnsupportedError('Unsupported WKProto packet encoding');
+      }
+      var body = packetEncodeFunc(packet);
       var header = encodeHeader(packet, body.length);
       write.writeBytes(header);
       write.writeBytes(body);
@@ -71,6 +77,9 @@ class Proto {
   Packet decode(Uint8List data) {
     var reader = ReadData(data);
     var header = decodeHeader(reader);
+    if (header.remainingLength != reader.remainingLength) {
+      throw const FormatException('WKProto frame length mismatch');
+    }
     if (header.packetType == PacketType.ping) {
       return PingPacket();
     }
@@ -81,11 +90,18 @@ class Proto {
     if (packetDecodeFunc == null) {
       return UnknownPacket(header, reader.readRemaining());
     }
-    return packetDecodeFunc(header, reader);
+    final packet = packetDecodeFunc(header, reader) as Packet;
+    if (reader.remainingLength != 0) {
+      throw const FormatException('Unexpected WKProto trailing fields');
+    }
+    return packet;
   }
 }
 
 Uint8List encodeConnect(ConnectPacket packet) {
+  if (packet.version != currentProtocolVersion) {
+    throw const FormatException('WKProto requires protocol version 6');
+  }
   WriteData write = WriteData();
   write.writeUint8(packet.version);
   write.writeUint8(packet.deviceFlag);
@@ -94,11 +110,9 @@ Uint8List encodeConnect(ConnectPacket packet) {
   write.writeString(packet.token);
   write.writeUint64(BigInt.from(packet.clientTimestamp));
   write.writeString(packet.clientKey);
-  if (packet.version == 6) {
-    write.writeString(packet.appInstanceID);
-    write.writeUint64(BigInt.from(packet.installationGeneration));
-    write.writeUint64(BigInt.from(packet.sessionGeneration));
-  }
+  write.writeString(packet.appInstanceID);
+  write.writeUint64(BigInt.from(packet.installationGeneration));
+  write.writeUint64(BigInt.from(packet.sessionGeneration));
   return write.toUint8List();
 }
 
@@ -107,17 +121,15 @@ decodeConnack(PacketHeader header, ReadData reader) {
   connAck.header = header;
   if (header.hasServerVersion) {
     var version = reader.readByte();
-    Logs.debug("server protocol version: $version");
-    connAck.serviceProtoVersion =
-        min(version, WKIM.shared.options.protoVersion);
+    if (version != currentProtocolVersion) {
+      throw const FormatException('WKProto requires server protocol version 6');
+    }
   }
-  connAck.timeDiff = reader.readUint64().toInt();
+  connAck.timeDiff = reader.readInt64();
   connAck.reasonCode = reader.readUint8();
   connAck.serverKey = reader.readString();
   connAck.salt = reader.readString();
-  if (connAck.serviceProtoVersion >= 4) {
-    connAck.nodeId = reader.readUint64().toInt();
-  }
+  connAck.nodeId = reader.readUint64AsInt();
   return connAck;
 }
 
@@ -127,6 +139,7 @@ PacketHeader decodeHeader(ReadData reader) {
   header.noPersist = (b & 0x01) > 0;
   header.showUnread = ((b >> 1) & 0x01) > 0;
   header.syncOnce = ((b >> 2) & 0x01) > 0;
+  header.dup = ((b >> 3) & 0x01) > 0;
   header.packetTypeValue = b >> 4;
   header.packetType = packetTypeFromValue(header.packetTypeValue);
   if (header.packetType != PacketType.ping &&
@@ -153,7 +166,8 @@ encodeHeader(Packet packet, int remainingLength) {
   }
   List<int> headers = [];
 
-  var typeAndFlags = (encodeBool(false) << 3) |
+  var typeAndFlags =
+      (encodeBool(packet.header.dup) << 3) |
       (encodeBool(packet.header.syncOnce) << 2) |
       (encodeBool(packet.header.showUnread) << 1) |
       encodeBool(packet.header.noPersist);
@@ -183,41 +197,35 @@ List<int> encodeVariableLength(int len) {
 }
 
 Uint8List encodeSend(SendPacket packet) {
+  final content = packet.encodeMsgContent();
   WriteData write = WriteData();
   write.writeUint8(packet.setting.encode());
   write.writeUint32(packet.clientSeq);
   write.writeString(packet.clientMsgNO);
   write.writeString(packet.channelID);
   write.writeUint8(packet.channelType);
-  if (WKIM.shared.options.protoVersion >= 3) {
-    write.writeUint32(packet.expire);
-  }
-  write.writeString(packet.encodeMsgKey());
+  write.writeUint32(packet.expire);
+  write.writeString(packet.encodeMsgKey(encodedContent: content));
   if (packet.setting.topic == 1) {
     write.writeString(packet.topic == null ? "" : packet.topic!);
   }
-  write.writeBytes(packet.encodeMsgContent().codeUnits);
+  write.writeBytes(utf8.encode(content));
   return write.toUint8List();
 }
 
 Uint8List encodeRecvAck(RecvAckPacket packet) {
   WriteData write = WriteData();
   write.writeUint64(packet.messageID);
-  if (WKIM.shared.options.protoVersion >= 6) {
-    write.writeUint64(BigInt.from(packet.messageSeq));
-  } else {
-    write.writeUint32(packet.messageSeq);
-  }
+  write.writeUint64(BigInt.from(packet.messageSeq));
   return write.toUint8List();
 }
 
 SendAckPacket decodeSendAck(PacketHeader header, ReadData reader) {
   var sendack = SendAckPacket();
+  sendack.header = header;
   sendack.messageID = reader.readUint64().toString();
   sendack.clientSeq = reader.readUint32();
-  sendack.messageSeq = WKIM.shared.options.protoVersion >= 6
-      ? reader.readUint64().toInt()
-      : reader.readUint32();
+  sendack.messageSeq = reader.readUint64AsInt();
   sendack.reasonCode = reader.readUint8();
   if (reader.remainingLength > 0) {
     sendack.clientMsgNO = reader.readString();
@@ -234,20 +242,16 @@ RecvPacket decodeRecv(PacketHeader header, ReadData reader) {
   recv.fromUID = reader.readString();
   recv.channelID = reader.readString();
   recv.channelType = reader.readUint8().toInt();
-  if (WKIM.shared.options.protoVersion >= 3) {
-    recv.expire = reader.readUint32().toInt();
-  }
+  recv.expire = reader.readUint32();
   recv.clientMsgNO = reader.readString();
   recv.messageID = reader.readUint64();
-  recv.messageSeq = WKIM.shared.options.protoVersion >= 6
-      ? reader.readUint64().toInt()
-      : reader.readUint32().toInt();
+  recv.messageSeq = reader.readUint64AsInt();
   recv.messageTime = reader.readUint32().toInt();
   if (recv.setting.topic == 1) {
     recv.topic = reader.readString();
   }
   var payload = reader.readRemaining();
-  recv.payload = String.fromCharCodes(payload);
+  recv.payload = utf8.decode(payload);
   return recv;
 }
 
@@ -256,13 +260,14 @@ EventPacket decodeEvent(PacketHeader header, ReadData reader) {
   event.header = header;
   event.eventID = reader.readString();
   event.eventType = reader.readString();
-  event.timestamp = reader.readUint64().toInt();
+  event.timestamp = reader.readUint64AsInt();
   event.data = reader.readRemaining();
   return event;
 }
 
 DisconnectPacket decodeDisconnect(PacketHeader header, ReadData reader) {
   var disconnect = DisconnectPacket();
+  disconnect.header = header;
   disconnect.reasonCode = reader.readUint8();
   disconnect.reason = reader.readString();
   return disconnect;
