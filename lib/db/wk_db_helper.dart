@@ -43,7 +43,16 @@ class WKDBHelper {
       if (_initializationGeneration == _lifecycleGeneration) {
         _lifecycleGeneration++;
       }
-      return active.then((_) => init(), onError: (_, __) => init());
+      final generation = _lifecycleGeneration;
+      Future<bool> resume() {
+        if (generation != _lifecycleGeneration ||
+            WKIM.shared.options.uid != uid) {
+          return Future<bool>.value(false);
+        }
+        return init();
+      }
+
+      return active.then((_) => resume(), onError: (_, __) => resume());
     }
 
     if (current != null) {

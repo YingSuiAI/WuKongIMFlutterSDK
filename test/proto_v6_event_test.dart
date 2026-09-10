@@ -73,7 +73,7 @@ void main() {
     expect(reader.remainingLength, 0);
   });
 
-  test('pre-v6 CONNECT does not append v6 session identity fields', () {
+  test('pre-v6 CONNECT is rejected instead of encoding legacy identity', () {
     final packet = ConnectPacket(
       version: 5,
       deviceID: 'legacy-device',
@@ -86,11 +86,7 @@ void main() {
       sessionGeneration: 9,
     );
 
-    final encoded = Proto().encode(packet);
-    final bodyLength = encoded.length - 2;
-    const expectedBodyLength = 1 + 1 + 2 + 13 + 2 + 11 + 2 + 12 + 8 + 2 + 10;
-
-    expect(bodyLength, expectedBodyLength);
+    expect(() => Proto().encode(packet), throwsFormatException);
   });
 
   test('decodes the optional SENDACK client message number suffix', () {

@@ -20,7 +20,14 @@ import 'package:wukongimfluttersdk/wkim.dart';
 
 **初始化sdk**
 ```dart
-WKIM.shared.setup(Options.newDefault('uid', 'token'));
+// All identity values come from the current server-issued IM session.
+final options = Options.newDefault(uid, token)
+  ..installationID = installationId
+  ..appInstanceID = appInstanceId
+  ..installationGeneration = installationGeneration
+  ..sessionGeneration = sessionGeneration;
+final ready = await WKIM.shared.setup(options);
+if (!ready) return; // This setup was rejected or superseded by another session.
 ```
 **初始化IP**
 ```dart
@@ -42,8 +49,22 @@ WKIM.shared.connectionManager.disconnect(isLogout)
 
 **发消息**
 ```dart
-WKIM.shared.messageManager.sendMessage(WKTextContent('我是文本消息'), WKChannel(channelID, channelType));
+await WKIM.shared.messageManager.sendMessage(
+  WKTextContent('我是文本消息'),
+  WKChannel(channelID, channelType),
+);
 ```
+
+### 当前协议与生命周期
+
+- 只支持协议 v6 和完整的服务端会话身份，不降级到旧协议。初始化和发送的
+  Future 必须等待并处理失败；发送 Future 完成不等于服务端已提交，最终结果由
+  与当前发送尝试匹配的 SENDACK 驱动。
+- 异步消息操作绑定发起时的会话和数据库。同会话断线重连保留待确认发送；登出或
+  更换身份不能重发旧会话消息，迟到 ACK 不能更新新账号数据库。
+- SQLite 内的 `wk_schema_migrations` 是唯一迁移完成依据。当前数据库可原位重开，
+  新数据库按事务初始化；无此 ledger 的旧业务数据库不受支持，不读取旧偏好水位，
+  也不会自动清库或改路径。初始化失败必须交回调用方处理。
 
 ## 监听
 **连接监听**

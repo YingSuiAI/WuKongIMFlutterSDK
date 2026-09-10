@@ -7,10 +7,12 @@ class WKDatabaseMigrator {
 
   Future<int> migrate(Database database, Map<int, String> migrations) async {
     final versions = migrations.keys.toList()..sort();
+    for (final version in versions) {
+      if (_statements(migrations[version]!).isEmpty) {
+        throw StateError('Migration $version has no executable statements.');
+      }
+    }
 
-    // SQLite otherwise fails BEGIN EXCLUSIVE immediately when another SDK
-    // connection is completing the same migration.
-    await database.execute('PRAGMA busy_timeout = 10000');
     await _exclusiveTransaction(database, (transaction) async {
       await transaction.execute('''
 CREATE TABLE IF NOT EXISTS $migrationTable (
@@ -18,6 +20,26 @@ CREATE TABLE IF NOT EXISTS $migrationTable (
   applied_at INTEGER NOT NULL
 )
 ''');
+      final recorded = await _recordedVersions(transaction);
+      _requirePrefix(recorded, versions, label: 'Migration ledger');
+
+      if (recorded.isEmpty) {
+        final existingTables = await transaction.query(
+          'sqlite_master',
+          columns: const ['name'],
+          // Android creates its locale metadata before SDK initialization.
+          where:
+              "type = 'table' AND name NOT GLOB 'sqlite_*' "
+              "AND name != 'android_metadata' AND name != ?",
+          whereArgs: const [migrationTable],
+          limit: 1,
+        );
+        if (existingTables.isNotEmpty) {
+          throw StateError(
+            'An existing schema requires a SQLite migration ledger.',
+          );
+        }
+      }
     });
 
     for (final version in versions) {
@@ -42,18 +64,25 @@ CREATE TABLE IF NOT EXISTS $migrationTable (
     Database database,
     Future<T> Function(Transaction transaction) action,
   ) async {
-    final deadline = DateTime.now().add(const Duration(seconds: 10));
     var delay = const Duration(milliseconds: 20);
-    while (true) {
+    for (var attempt = 1; ; attempt++) {
+      var actionStarted = false;
       try {
-        return await database.transaction(action, exclusive: true);
+        return await database.transaction((transaction) {
+          actionStarted = true;
+          return action(transaction);
+        }, exclusive: true);
       } on DatabaseException catch (error) {
         final resultCode = error.getResultCode();
         final primaryCode = resultCode == null ? null : resultCode & 0xff;
         final locked = primaryCode == 5 || primaryCode == 6;
-        if (!locked || DateTime.now().isAfter(deadline)) rethrow;
+        // Only retry lock acquisition. Once the action starts, especially if
+        // COMMIT fails, its connection state must not be blindly replayed.
+        // Do not set PRAGMA busy_timeout: Android execute rejects row results.
+        if (!locked || actionStarted || attempt >= 8) rethrow;
         await Future<void>.delayed(delay);
-        if (delay < const Duration(milliseconds: 500)) delay *= 2;
+        final nextDelay = delay.inMilliseconds * 2;
+        delay = Duration(milliseconds: nextDelay > 500 ? 500 : nextDelay);
       }
     }
   }
@@ -67,6 +96,36 @@ CREATE TABLE IF NOT EXISTS $migrationTable (
       limit: 1,
     );
     return rows.isNotEmpty;
+  }
+
+  Future<List<int>> _recordedVersions(DatabaseExecutor database) async {
+    final rows = await database.query(
+      migrationTable,
+      columns: const ['version'],
+      orderBy: 'version',
+    );
+    return rows.map((row) {
+      final version = row['version'];
+      if (version is! int) {
+        throw StateError('Migration ledger contains an invalid version.');
+      }
+      return version;
+    }).toList();
+  }
+
+  void _requirePrefix(
+    List<int> candidate,
+    List<int> catalog, {
+    required String label,
+  }) {
+    if (candidate.length > catalog.length) {
+      throw StateError('$label contains an unknown migration version.');
+    }
+    for (var index = 0; index < candidate.length; index++) {
+      if (candidate[index] != catalog[index]) {
+        throw StateError('$label is not a contiguous migration prefix.');
+      }
+    }
   }
 
   Iterable<String> _statements(String script) sync* {

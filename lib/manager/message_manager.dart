@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 
+import 'package:sqflite/sqflite.dart';
+
 import 'package:uuid/uuid.dart';
 import 'package:wukongimfluttersdk/common/logs.dart';
 import 'package:wukongimfluttersdk/db/const.dart';
@@ -14,10 +16,32 @@ import 'package:wukongimfluttersdk/proto/proto.dart';
 import 'package:wukongimfluttersdk/type/const.dart';
 
 import '../entity/channel.dart';
+import '../db/wk_db_helper.dart';
 import '../entity/conversation.dart';
 import '../model/wk_message_content.dart';
 import '../model/wk_unknown_content.dart';
 import '../wkim.dart';
+
+/// Binds asynchronous message work to the session and database that admitted it.
+class _MessageOwner {
+  final Database? database = WKDBHelper.shared.getDB();
+  final options = WKIM.shared.options;
+  final String? uid = WKIM.shared.options.uid;
+  final identity = WKIM.shared.options.sessionIdentity;
+
+  bool get isCurrent =>
+      identical(options, WKIM.shared.options) &&
+      identity == WKIM.shared.options.sessionIdentity &&
+      identical(database, WKDBHelper.shared.getDB());
+
+  void ensureCurrent() {
+    if (!isCurrent) throw StateError('The message session has been replaced.');
+  }
+}
+
+class _StaleMessageOperation implements Exception {
+  const _StaleMessageOperation();
+}
 
 class WKMessageManager {
   WKMessageManager._privateConstructor();
@@ -28,7 +52,7 @@ class WKMessageManager {
   final Map<int, WKMessageContent Function(dynamic data)> _msgContentList =
       HashMap<int, WKMessageContent Function(dynamic data)>();
   Function(WKMsg wkMsg, Function(bool isSuccess, WKMsg wkMsg))?
-      _uploadAttachmentBack;
+  _uploadAttachmentBack;
   Function(WKMsg msg)? _msgInsertedBack;
   Function(WKMsgExtra)? _iUploadMsgExtraListener;
   HashMap<String, Function(List<WKMsg>)>? _newMsgBack;
@@ -36,13 +60,15 @@ class WKMessageManager {
   HashMap<String, Function(String)>? _deleteMsgBack;
   HashMap<String, Function(String, int)>? _clearChannelMsgBack;
   Function(
-      String channelID,
-      int channelType,
-      int startMessageSeq,
-      int endMessageSeq,
-      int limit,
-      int pullMode,
-      Function(WKSyncChannelMsg?) back)? _syncChannelMsgBack;
+    String channelID,
+    int channelType,
+    int startMessageSeq,
+    int endMessageSeq,
+    int limit,
+    int pullMode,
+    Function(WKSyncChannelMsg?) back,
+  )?
+  _syncChannelMsgBack;
 
   final int wkOrderSeqFactor = 1000;
 
@@ -177,8 +203,8 @@ class WKMessageManager {
     return MessageDB.shared.queryWithClientMsgNo(clientMsgNo);
   }
 
-  Future<int> saveMsg(WKMsg msg) async {
-    return await MessageDB.shared.insert(msg);
+  Future<int> saveMsg(WKMsg msg, {DatabaseExecutor? database}) async {
+    return await MessageDB.shared.insert(msg, database: database);
   }
 
   String generateClientMsgNo() {
@@ -602,12 +628,65 @@ class WKMessageManager {
     _uploadAttachmentBack = back;
   }
 
-  sendMessage(WKMessageContent messageContent, WKChannel channel) async {
-    sendWithOption(messageContent, channel, WKSendOptions());
+  Future<void> sendMessage(WKMessageContent messageContent, WKChannel channel) {
+    return sendWithOption(messageContent, channel, WKSendOptions());
   }
 
-  sendWithOption(WKMessageContent messageContent, WKChannel channel,
-      WKSendOptions options) async {
+  /// Persists a newly authored message and its conversation as one operation.
+  /// The caller owns envelope encoding, UI publication, and transport admission.
+  Future<WKUIConversationMsg?> saveOutgoingMessage(
+    WKMsg message, {
+    bool Function()? isCurrent,
+  }) async {
+    final owner = _MessageOwner();
+    void ensureCurrent() {
+      owner.ensureCurrent();
+      if (!(isCurrent?.call() ?? true)) {
+        throw StateError('The outgoing message operation was cancelled.');
+      }
+    }
+
+    ensureCurrent();
+    final database = owner.database;
+    if (database == null) throw StateError('Message database is not open.');
+    if (message.clientSeq != 0) {
+      throw StateError('An outgoing message must not already be persisted.');
+    }
+    final saved = await database.transaction((transaction) async {
+      ensureCurrent();
+      final orderSeq = await MessageDB.shared.queryMaxOrderSeq(
+        message.channelID, message.channelType, database: transaction) + 1;
+      ensureCurrent();
+      final values = MessageDB.shared.getMap(message) as Map<String, dynamic>;
+      values['order_seq'] = orderSeq;
+      // A duplicate idempotency key is an error, never a renamed tombstone.
+      final clientSeq = await transaction.insert(
+        WKDBConst.tableMessage, values,
+        conflictAlgorithm: ConflictAlgorithm.abort);
+      ensureCurrent();
+      final conversation = await WKIM.shared.conversationManager.saveWithWKMsg(
+        message, 0, database: transaction);
+      ensureCurrent();
+      return (clientSeq, orderSeq, conversation);
+    });
+    ensureCurrent();
+    message.clientSeq = saved.$1;
+    message.orderSeq = saved.$2;
+    return saved.$3;
+  }
+
+  Future<void> sendWithOption(
+    WKMessageContent messageContent,
+    WKChannel channel,
+    WKSendOptions options,
+  ) async {
+    final owner = _MessageOwner();
+    if (owner.uid == null || owner.uid!.isEmpty) {
+      throw StateError('A message requires an authenticated owner.');
+    }
+    if (!options.header.noPersist && owner.database == null) {
+      throw StateError('Message database is not open.');
+    }
     WKMsg wkMsg = WKMsg();
     wkMsg.setting = options.setting;
     wkMsg.header = options.header;
@@ -619,83 +698,100 @@ class WKMessageManager {
     }
     wkMsg.channelID = channel.channelID;
     wkMsg.channelType = channel.channelType;
-    wkMsg.fromUID = WKIM.shared.options.uid!;
+    wkMsg.fromUID = owner.uid!;
     wkMsg.contentType = messageContent.contentType;
 
     wkMsg.content = _getSendPayload(wkMsg);
     wkMsg.setChannelInfo(channel);
-    WKChannel? from = await WKIM.shared.channelManager
-        .getChannel(wkMsg.fromUID, WKChannelType.personal);
+    WKChannel? from = await WKIM.shared.channelManager.getChannel(
+      wkMsg.fromUID,
+      WKChannelType.personal,
+    );
+    owner.ensureCurrent();
     if (from != null) {
       wkMsg.setFrom(from);
     }
     if (!options.header.noPersist) {
-      int tempOrderSeq = await MessageDB.shared
-          .queryMaxOrderSeq(wkMsg.channelID, wkMsg.channelType);
-      wkMsg.orderSeq = tempOrderSeq + 1;
-      int row = await saveMsg(wkMsg);
-      wkMsg.clientSeq = row;
-      if (row > 0) {
-        WKUIConversationMsg? uiMsg =
-            await WKIM.shared.conversationManager.saveWithWKMsg(wkMsg, 0);
-        WKIM.shared.messageManager.setOnMsgInserted(wkMsg);
-        if (uiMsg != null) {
-          List<WKUIConversationMsg> uiMsgs = [];
-          uiMsgs.add(uiMsg);
-          WKIM.shared.conversationManager.setRefreshUIMsgs(uiMsgs);
-        }
+      final uiMsg = await saveOutgoingMessage(wkMsg,
+        isCurrent: () => owner.isCurrent);
+      owner.ensureCurrent();
+      setOnMsgInserted(wkMsg);
+      owner.ensureCurrent();
+      if (uiMsg != null) {
+        WKIM.shared.conversationManager.setRefreshUIMsgs([uiMsg]);
       }
     }
 
+    owner.ensureCurrent();
     if (wkMsg.messageContent is WKMediaMessageContent) {
-      // 附件消息
-      if (_uploadAttachmentBack != null) {
-        _uploadAttachmentBack!(wkMsg, (isSuccess, uploadedMsg) {
-          if (!isSuccess) {
-            wkMsg.status = WKSendMsgResult.sendFail;
-            updateMsgStatusFail(wkMsg.clientSeq);
-            return;
-          }
-          // 重新编码消息正文
-          Map<String, dynamic> json = uploadedMsg.messageContent!.encodeJson();
-          json['type'] = uploadedMsg.contentType;
-          //uploadedMsg.content = jsonEncode(json);
-          updateContent(
-              uploadedMsg.clientMsgNO, uploadedMsg.messageContent!, false);
-          Map<String, dynamic> sendJson = HashMap();
-          // 过滤 ‘localPath’ 和 ‘coverLocalPath’
-          json.forEach((key, value) {
-            if (key != 'localPath' && key != 'coverLocalPath') {
-              sendJson[key] = value;
-            }
-          });
-          uploadedMsg.content = jsonEncode(sendJson);
-          WKIM.shared.connectionManager.sendMessage(uploadedMsg);
-        });
-      } else {
-        Logs.debug(
-            '未监听附件消息上传事件，请监听`WKMessageManager`的`addOnUploadAttachmentListener`方法');
+      final upload = _uploadAttachmentBack;
+      if (upload == null) {
+        await updateMsgStatusFail(wkMsg.clientSeq);
+        throw StateError('An attachment upload listener is required.');
       }
+      final completion = Completer<(bool, WKMsg)>();
+      final messageIdentity = (wkMsg.clientMsgNO, wkMsg.clientSeq,
+        wkMsg.fromUID, wkMsg.channelID, wkMsg.channelType);
+      upload(wkMsg, (success, uploaded) {
+        if (!completion.isCompleted) completion.complete((success, uploaded));
+      });
+      final result = await completion.future;
+      owner.ensureCurrent();
+      if (!result.$1) {
+        await updateMsgStatusFail(wkMsg.clientSeq);
+        throw StateError('Attachment upload failed.');
+      }
+      final uploadedMsg = result.$2;
+      if ((uploadedMsg.clientMsgNO, uploadedMsg.clientSeq, uploadedMsg.fromUID,
+          uploadedMsg.channelID, uploadedMsg.channelType) != messageIdentity) {
+        throw StateError('Attachment upload changed the message identity.');
+      }
+      final payload = _getSendPayload(uploadedMsg);
+      if (!options.header.noPersist) {
+        await MessageDB.shared.updateMsgWithFieldAndClientMsgNo(
+          {'content': payload},
+          wkMsg.clientMsgNO,
+          database: owner.database,
+        );
+        owner.ensureCurrent();
+      }
+      final sendJson = jsonDecode(payload) as Map<String, dynamic>;
+      sendJson.remove('localPath');
+      sendJson.remove('coverLocalPath');
+      uploadedMsg.content = jsonEncode(sendJson);
+      await WKIM.shared.connectionManager.sendMessage(uploadedMsg);
     } else {
-      WKIM.shared.connectionManager.sendMessage(wkMsg);
+      await WKIM.shared.connectionManager.sendMessage(wkMsg);
     }
   }
 
   @Deprecated('use sendWithOption')
   sendMessageWithSetting(
-      WKMessageContent messageContent, WKChannel channel, Setting setting) {
+    WKMessageContent messageContent,
+    WKChannel channel,
+    Setting setting,
+  ) {
     var header = MessageHeader();
     header.redDot = true;
-    sendMessageWithSettingAndHeader(messageContent, channel, setting, header);
+    return sendMessageWithSettingAndHeader(
+      messageContent,
+      channel,
+      setting,
+      header,
+    );
   }
 
   @Deprecated('use sendWithOption')
-  sendMessageWithSettingAndHeader(WKMessageContent messageContent,
-      WKChannel channel, Setting setting, MessageHeader header) async {
+  sendMessageWithSettingAndHeader(
+    WKMessageContent messageContent,
+    WKChannel channel,
+    Setting setting,
+    MessageHeader header,
+  ) async {
     var options = WKSendOptions();
     options.setting = setting;
     options.header = header;
-    sendWithOption(messageContent, channel, options);
+    return sendWithOption(messageContent, channel, options);
   }
 
   String _getSendPayload(WKMsg wkMsg) {
@@ -737,9 +833,21 @@ class WKMessageManager {
     return jsonEncode(json);
   }
 
-  updateSendResult(
-      String messageID, int clientSeq, int messageSeq, int reasonCode) async {
-    WKMsg? wkMsg = await MessageDB.shared.queryWithClientSeq(clientSeq);
+  Future<void> updateSendResult(
+    String messageID,
+    int clientSeq,
+    int messageSeq,
+    int reasonCode, {
+    bool Function()? isCurrent,
+  }) async {
+    final owner = _MessageOwner();
+    bool current() => owner.isCurrent && (isCurrent?.call() ?? true);
+    if (owner.database == null || !current()) return;
+    WKMsg? wkMsg = await MessageDB.shared.queryWithClientSeq(
+      clientSeq,
+      database: owner.database,
+    );
+    if (!current()) return;
     if (wkMsg != null) {
       wkMsg.messageID = messageID;
       wkMsg.messageSeq = messageSeq;
@@ -748,28 +856,64 @@ class WKMessageManager {
       map['message_id'] = messageID;
       map['message_seq'] = messageSeq;
       map['status'] = reasonCode;
-      int orderSeq = await WKIM.shared.messageManager
-          .getMessageOrderSeq(messageSeq, wkMsg.channelID, wkMsg.channelType);
+      int orderSeq = messageSeq == 0
+          ? wkMsg.orderSeq
+          : messageSeq * wkOrderSeqFactor;
       map['order_seq'] = orderSeq;
-      await MessageDB.shared.updateMsgWithField(map, clientSeq);
       wkMsg.orderSeq = orderSeq;
-      setRefreshMsg(wkMsg);
+      try {
+        await owner.database!.transaction((transaction) async {
+          void ensureCurrent() {
+            if (!current()) throw const _StaleMessageOperation();
+          }
 
-      // 更新最近会话
-      WKIM.shared.conversationManager.saveWithWKMsg(wkMsg, 0);
+          ensureCurrent();
+          await MessageDB.shared.updateMsgWithField(
+            map,
+            clientSeq,
+            database: transaction,
+          );
+          ensureCurrent();
+          final last = await ConversationDB.shared.queryMsgByMsgChannelId(
+            wkMsg.channelID,
+            wkMsg.channelType,
+            database: transaction,
+          );
+          ensureCurrent();
+          // An older SENDACK must not replace a newer conversation preview.
+          if (last == null || last.lastClientMsgNO == wkMsg.clientMsgNO) {
+            await WKIM.shared.conversationManager.saveWithWKMsg(
+              wkMsg,
+              0,
+              database: transaction,
+            );
+          }
+          ensureCurrent();
+        });
+      } on _StaleMessageOperation {
+        return;
+      }
+      if (!current()) return;
+      setRefreshMsg(wkMsg);
     }
   }
 
-  updateMsgStatusFail(int clientMsgSeq) async {
+  Future<void> updateMsgStatusFail(int clientMsgSeq) async {
+    final owner = _MessageOwner();
+    if (owner.database == null) return;
     var map = <String, Object>{};
     map['status'] = WKSendMsgResult.sendFail;
-    int row = await MessageDB.shared.updateMsgWithField(map, clientMsgSeq);
-    if (row > 0) {
-      MessageDB.shared.queryWithClientSeq(clientMsgSeq).then((wkMsg) {
-        if (wkMsg != null) {
-          setRefreshMsg(wkMsg);
-        }
-      });
+    int row = await MessageDB.shared.updateMsgWithField(
+      map,
+      clientMsgSeq,
+      database: owner.database,
+    );
+    if (row > 0 && owner.isCurrent) {
+      final wkMsg = await MessageDB.shared.queryWithClientSeq(
+        clientMsgSeq,
+        database: owner.database,
+      );
+      if (wkMsg != null && owner.isCurrent) setRefreshMsg(wkMsg);
     }
   }
 
@@ -792,8 +936,8 @@ class WKMessageManager {
     }
   }
 
-  updateSendingMsgFail() {
-    MessageDB.shared.updateSendingMsgFail();
+  Future<void> updateSendingMsgFail() {
+    return MessageDB.shared.updateSendingMsgFail();
   }
 
   updateLocalExtraWithClientMsgNo(

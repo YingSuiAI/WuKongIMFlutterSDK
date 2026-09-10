@@ -128,6 +128,7 @@ class _HistoryDatabaseFactory extends SqfliteDatabaseFactory {
 
 class _HistoryDatabase implements Database {
   var _rawQueryCount = 0;
+  final _migrationVersions = <int>{};
 
   @override
   String get path => ':memory:';
@@ -162,7 +163,9 @@ class _HistoryDatabase implements Database {
           int? offset}) async {
     if (table == WKDatabaseMigrator.migrationTable) {
       return [
-        {'version': whereArgs?.first ?? 202604271625},
+        for (final version in _migrationVersions.toList()..sort())
+          if (whereArgs == null || whereArgs.first == version)
+            {'version': version},
       ];
     }
     return <Map<String, Object?>>[];
@@ -171,8 +174,12 @@ class _HistoryDatabase implements Database {
   @override
   Future<int> insert(String table, Map<String, Object?> values,
           {String? nullColumnHack,
-          ConflictAlgorithm? conflictAlgorithm}) async =>
-      1;
+          ConflictAlgorithm? conflictAlgorithm}) async {
+    if (table == WKDatabaseMigrator.migrationTable) {
+      _migrationVersions.add(values['version'] as int);
+    }
+    return 1;
+  }
 
   @override
   Future<void> execute(String sql, [List<Object?>? arguments]) async {}

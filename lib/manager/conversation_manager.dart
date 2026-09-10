@@ -1,4 +1,5 @@
 import 'dart:collection';
+import 'package:sqflite/sqflite.dart';
 
 import 'package:wukongimfluttersdk/db/message.dart';
 import 'package:wukongimfluttersdk/db/reaction.dart';
@@ -24,11 +25,11 @@ class WKConversationManager {
 
   /// 单个会话刷新监听器
   late final HashMap<String, Function(WKUIConversationMsg, bool)>
-      _refreshMsgMap;
+  _refreshMsgMap;
 
   /// 会话列表刷新监听器
   late final HashMap<String, Function(List<WKUIConversationMsg>)>
-      _refreshMsgListMap;
+  _refreshMsgListMap;
 
   /// 会话删除监听器
   late final HashMap<String, Function(String, int)> _deleteMsgMap;
@@ -37,8 +38,13 @@ class WKConversationManager {
   late final HashMap<String, Function()> _clearAllRedDotMap;
 
   /// 同步会话回调
-  Function(String lastMsgSeqs, int msgCount, int version,
-      Function(WKSyncConversation))? _syncConversationBack;
+  Function(
+    String lastMsgSeqs,
+    int msgCount,
+    int version,
+    Function(WKSyncConversation),
+  )?
+  _syncConversationBack;
 
   /// 获取所有会话
   Future<List<WKUIConversationMsg>> getAll() async {
@@ -55,7 +61,11 @@ class WKConversationManager {
   }
 
   /// 根据消息保存会话
-  Future<WKUIConversationMsg?> saveWithWKMsg(WKMsg msg, int redDot) async {
+  Future<WKUIConversationMsg?> saveWithWKMsg(
+    WKMsg msg,
+    int redDot, {
+    DatabaseExecutor? database,
+  }) async {
     WKConversationMsg wkConversationMsg = WKConversationMsg();
     if (msg.channelType == WKChannelType.communityTopic &&
         msg.channelID.isNotEmpty) {
@@ -72,7 +82,7 @@ class WKConversationManager {
     wkConversationMsg.lastMsgSeq = msg.messageSeq;
     wkConversationMsg.unreadCount = redDot;
     WKUIConversationMsg? uiMsg = await ConversationDB.shared
-        .insertOrUpdateWithConvMsg(wkConversationMsg);
+        .insertOrUpdateWithConvMsg(wkConversationMsg, database: database);
     return uiMsg;
   }
 

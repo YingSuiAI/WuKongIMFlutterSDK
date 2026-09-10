@@ -26,13 +26,19 @@ class ReactionDB {
     return maxSeq;
   }
 
-  Future<List<WKMsgReaction>> queryWithMessageId(String messageId) async {
+  Future<List<WKMsgReaction>> queryWithMessageId(
+    String messageId, {
+    DatabaseExecutor? database,
+  }) async {
+    final db = database ?? WKDBHelper.shared.getDB();
     List<WKMsgReaction> list = [];
-    List<Map<String, Object?>> results = await WKDBHelper.shared.getDB()!.query(
-        WKDBConst.tableMessageReaction,
-        where: "message_id=? and is_deleted=0",
-        whereArgs: [messageId],
-        orderBy: "created_at desc");
+    if (db == null) return list;
+    List<Map<String, Object?>> results = await db.query(
+      WKDBConst.tableMessageReaction,
+      where: "message_id=? and is_deleted=0",
+      whereArgs: [messageId],
+      orderBy: "created_at desc",
+    );
     if (results.isNotEmpty) {
       for (Map<String, Object?> data in results) {
         list.add(WKDBConst.serializeMsgReaction(data));
