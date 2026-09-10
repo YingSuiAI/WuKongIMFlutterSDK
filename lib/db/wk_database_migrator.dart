@@ -5,121 +5,74 @@ import 'package:sqflite/sqflite.dart';
 class WKDatabaseMigrator {
   static const migrationTable = 'wk_schema_migrations';
 
-  Future<int> migrate(
-    Database database,
-    Map<int, String> migrations, {
-    int legacyMaxVersion = 0,
-  }) async {
-    await database.execute('''
+  Future<int> migrate(Database database, Map<int, String> migrations) async {
+    final versions = migrations.keys.toList()..sort();
+
+    // SQLite otherwise fails BEGIN EXCLUSIVE immediately when another SDK
+    // connection is completing the same migration.
+    await database.execute('PRAGMA busy_timeout = 10000');
+    await _exclusiveTransaction(database, (transaction) async {
+      await transaction.execute('''
 CREATE TABLE IF NOT EXISTS $migrationTable (
   version INTEGER PRIMARY KEY,
   applied_at INTEGER NOT NULL
 )
 ''');
+    });
 
-    final versions = migrations.keys.toList()..sort();
-    if (legacyMaxVersion > 0) {
-      await database.transaction((transaction) async {
-        for (final version in versions.where(
-          (version) => version <= legacyMaxVersion,
-        )) {
-          await _recordApplied(transaction, version);
-        }
-      });
-    }
-
-    final completed = await _completedVersions(database);
     for (final version in versions) {
-      if (completed.contains(version)) continue;
-      await database.transaction((transaction) async {
+      // Serializing before the completion check prevents separate database
+      // connections from both replaying a migration containing data changes.
+      await _exclusiveTransaction(database, (transaction) async {
+        if (await _isApplied(transaction, version)) return;
         for (final statement in _statements(migrations[version]!)) {
-          await _executeRecoverably(transaction, statement);
+          await transaction.execute(statement);
         }
-        await _recordApplied(transaction, version);
+        await transaction.insert(migrationTable, {
+          'version': version,
+          'applied_at': DateTime.now().millisecondsSinceEpoch,
+        });
       });
-      completed.add(version);
     }
-    return completed.isEmpty ? 0 : completed.reduce((a, b) => a > b ? a : b);
+
+    return versions.isEmpty ? 0 : versions.last;
   }
 
-  Future<Set<int>> _completedVersions(DatabaseExecutor database) async {
-    final rows = await database.query(migrationTable, columns: ['version']);
-    return rows.map((row) => row['version'] as int).toSet();
-  }
-
-  Future<void> _recordApplied(DatabaseExecutor database, int version) async {
-    await database.insert(migrationTable, {
-      'version': version,
-      'applied_at': DateTime.now().millisecondsSinceEpoch,
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-  }
-
-  Iterable<String> _statements(String script) sync* {
-    for (final statement in script.split(';')) {
-      final normalized = statement.replaceAll('\n', ' ').trim();
-      if (normalized.isNotEmpty) yield normalized;
-    }
-  }
-
-  Future<void> _executeRecoverably(
-    DatabaseExecutor database,
-    String statement,
+  Future<T> _exclusiveTransaction<T>(
+    Database database,
+    Future<T> Function(Transaction transaction) action,
   ) async {
-    final createTable = RegExp(
-      r'^create\s+table\s+(?:if\s+not\s+exists\s+)?[\x60\x27\x22]?([A-Za-z_][A-Za-z0-9_]*)',
-      caseSensitive: false,
-    ).firstMatch(statement);
-    if (createTable != null &&
-        await _schemaObjectExists(database, 'table', createTable.group(1)!)) {
-      return;
+    final deadline = DateTime.now().add(const Duration(seconds: 10));
+    var delay = const Duration(milliseconds: 20);
+    while (true) {
+      try {
+        return await database.transaction(action, exclusive: true);
+      } on DatabaseException catch (error) {
+        final resultCode = error.getResultCode();
+        final primaryCode = resultCode == null ? null : resultCode & 0xff;
+        final locked = primaryCode == 5 || primaryCode == 6;
+        if (!locked || DateTime.now().isAfter(deadline)) rethrow;
+        await Future<void>.delayed(delay);
+        if (delay < const Duration(milliseconds: 500)) delay *= 2;
+      }
     }
-
-    final createIndex = RegExp(
-      r'^create\s+(?:unique\s+)?index\s+(?:if\s+not\s+exists\s+)?[\x60\x27\x22]?([A-Za-z_][A-Za-z0-9_]*)',
-      caseSensitive: false,
-    ).firstMatch(statement);
-    if (createIndex != null &&
-        await _schemaObjectExists(database, 'index', createIndex.group(1)!)) {
-      return;
-    }
-
-    final addColumn = RegExp(
-      r'^alter\s+table\s+[\x60\x27\x22]?([A-Za-z_][A-Za-z0-9_]*)[\x60\x27\x22]?\s+add(?:\s+column)?\s+[\x60\x27\x22]?([A-Za-z_][A-Za-z0-9_]*)',
-      caseSensitive: false,
-    ).firstMatch(statement);
-    if (addColumn != null &&
-        await _columnExists(
-          database,
-          addColumn.group(1)!,
-          addColumn.group(2)!,
-        )) {
-      return;
-    }
-
-    await database.execute(statement);
   }
 
-  Future<bool> _schemaObjectExists(
-    DatabaseExecutor database,
-    String type,
-    String name,
-  ) async {
+  Future<bool> _isApplied(DatabaseExecutor database, int version) async {
     final rows = await database.query(
-      'sqlite_master',
-      columns: const ['name'],
-      where: 'type = ? AND name = ?',
-      whereArgs: [type, name],
+      migrationTable,
+      columns: const ['version'],
+      where: 'version = ?',
+      whereArgs: [version],
       limit: 1,
     );
     return rows.isNotEmpty;
   }
 
-  Future<bool> _columnExists(
-    DatabaseExecutor database,
-    String table,
-    String column,
-  ) async {
-    final rows = await database.rawQuery('PRAGMA table_info($table)');
-    return rows.any((row) => row['name'] == column);
+  Iterable<String> _statements(String script) sync* {
+    for (final statement in script.split(';')) {
+      final trimmed = statement.trim();
+      if (trimmed.isNotEmpty) yield trimmed;
+    }
   }
 }

@@ -214,7 +214,7 @@ class WKConnectionManager {
         WKIM.shared.options.uid = '';
         WKIM.shared.options.token = '';
         WKIM.shared.messageManager.updateSendingMsgFail();
-        WKDBHelper.shared.close();
+        unawaited(WKDBHelper.shared.close());
       }
     } finally {
       _closeAll();

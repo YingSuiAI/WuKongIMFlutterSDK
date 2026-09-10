@@ -6,6 +6,7 @@ import 'package:sqflite/sqflite.dart';
 // ignore: depend_on_referenced_packages
 import 'package:sqflite_common/src/factory.dart';
 import 'package:wukongimfluttersdk/db/message.dart';
+import 'package:wukongimfluttersdk/db/wk_database_migrator.dart';
 import 'package:wukongimfluttersdk/db/wk_db_helper.dart';
 import 'package:wukongimfluttersdk/entity/msg.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
@@ -62,7 +63,7 @@ void main() {
     expect(syncRequests, 1);
     expect(messages.map((message) => message.messageSeq), [2, 1]);
     WKIM.shared.messageManager.addOnSyncChannelMsgListener(null);
-    WKDBHelper.shared.close();
+    await WKDBHelper.shared.close();
   });
 
   test('without a sync listener the initial page remains local-only', () async {
@@ -86,7 +87,7 @@ void main() {
 
     final messages = await result.future;
     expect(messages.map((message) => message.messageSeq), [1]);
-    WKDBHelper.shared.close();
+    await WKDBHelper.shared.close();
   });
 }
 
@@ -158,8 +159,14 @@ class _HistoryDatabase implements Database {
           String? having,
           String? orderBy,
           int? limit,
-          int? offset}) async =>
-      <Map<String, Object?>>[];
+          int? offset}) async {
+    if (table == WKDatabaseMigrator.migrationTable) {
+      return [
+        {'version': whereArgs?.first ?? 202604271625},
+      ];
+    }
+    return <Map<String, Object?>>[];
+  }
 
   @override
   Future<int> insert(String table, Map<String, Object?> values,
