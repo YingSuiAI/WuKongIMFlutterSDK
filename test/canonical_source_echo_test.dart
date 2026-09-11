@@ -431,6 +431,24 @@ void main() {
       expect(commands.last.channelType, 0);
     },
   );
+
+  test(
+    'command metadata never mutates its strict application payload',
+    () async {
+      final commands = <WKCMD>[];
+      sdk.cmdManager.addOnCmdListener('strict-control', commands.add);
+      addTearDown(() => sdk.cmdManager.removeCmdListener('strict-control'));
+      echo(
+        content: '{"type":99,"cmd":"control.changed","param":{"cursor":7}}',
+        fromUID: 'system',
+        channelID: 'transport-owner',
+        noPersist: true,
+      );
+      await _until(() => commands.length == 1);
+      expect(commands.single.param, {'cursor': 7});
+      expect(commands.single.channelID, 'transport-owner');
+    },
+  );
 }
 
 class _ObservedProto extends Proto {
