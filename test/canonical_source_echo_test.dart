@@ -22,6 +22,8 @@ const _canonical =
     '{"type":"message.committed","version":1,"id":"019f0000-0000-7000-8000-000000000042",'
     '"created_at":"2026-09-11T08:00:00Z","payload":{"content":"canonical text"}}';
 const _applicationID = '019f0000-0000-7000-8000-000000000042';
+// Independent `sha256sum` oracle for the exact UTF-8 request in send().
+const _requestSHA256 = 'ffac8c766efe34509a2bebb9f7f8fd6ad2f13c956a8edcd8aaecbd71eb52458a';
 
 // Uses the real socket parser, AES integrity/decryption, v7 codec, SQLite
 // transaction and public SDK callbacks. No fake decoder/storage consumer.
@@ -205,7 +207,7 @@ void main() {
     final names = (await File('assets/sql.txt').readAsString())
         .split(';')
         .map((name) => name.trim())
-        .where((name) => name.isNotEmpty && name != '202609111800');
+        .where((name) => name.isNotEmpty && int.parse(name) < 202609111800);
     await WKDatabaseMigrator().migrate(old, {
       for (final name in names)
         int.parse(name): await File('assets/$name.sql').readAsString(),
@@ -237,6 +239,7 @@ void main() {
         expect(stored!.content, _canonical);
         expect(stored.messageID, '42');
         expect(stored.payloadCommitted, isTrue);
+        expect(stored.originalPayloadSHA256, _requestSHA256);
         expect(stored.fromUID, 'product-principal');
         expect(delivered, hasLength(1));
         expect(delivered.single.clientSeq, msg.clientSeq);
@@ -250,6 +253,11 @@ void main() {
         // Receipt state must survive restart, not just live in the pending map.
         await WKDBHelper.shared.close();
         await WKDBHelper.shared.init();
+        final reopened = await MessageDB.shared.queryWithClientSeq(msg.clientSeq);
+        expect(reopened!.originalPayloadSHA256, _requestSHA256);
+        expect(reopened.originalPayloadSHA256,
+          isNot('0756a9fd61f997017adb78c9fc4fa52d0b71e0317c251d22039d34010eec1c39'),
+          reason: 'same client number does not prove a different original body');
         echo();
         await _until(() => proto.receiveAcks == 2);
         expect(delivered, hasLength(1));
@@ -290,7 +298,19 @@ void main() {
     expect(stored.viewedAt, 123);
     expect(stored.localExtraMap, {'local': 'keep'});
     expect(stored.content, _canonical);
+    expect(stored.originalPayloadSHA256, _requestSHA256);
     expect(delivered, isEmpty);
+  });
+
+  test('peer RECV cannot manufacture a sender original-payload proof', () async {
+    final payload = jsonDecode(_canonical) as Map<String, dynamic>;
+    payload['original_payload_sha256'] = _requestSHA256;
+    echo(fromUID: 'remote-peer', content: jsonEncode(payload));
+    await _until(() => proto.receiveAcks == 1);
+    final stored = await MessageDB.shared.queryWithClientMsgNo('request-42');
+    expect(stored!.payloadCommitted, isTrue);
+    expect(stored.originalPayloadSHA256, isEmpty);
+    expect(delivered.single.originalPayloadSHA256, isEmpty);
   });
 
   test(

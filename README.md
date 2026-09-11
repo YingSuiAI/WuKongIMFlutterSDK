@@ -67,6 +67,9 @@ await WKIM.shared.messageManager.sendMessage(
   本地删除/已读状态，已提交正文冲突不会静默覆盖。重启后的应用身份从持久化正文读取。
   `payloadCommitted` 仅表示传输正文已固定，不代表正文符合某个应用契约；已有历史正文
   不会被自动转换为 `message.committed`，应用仍需按实际 envelope 类型校验。
+- `originalPayloadSHA256` 只记录发送方原始 SEND 字节的 SHA-256，与本地消息一起提交，
+  canonical 回声替换正文后仍保留。重试必须同时匹配发送者、binding、client key 和该摘要；
+  peer/history 或已有数据库中未知的摘要保持空，不能从 canonical 正文补算发送意图。
 - 异步消息操作绑定发起时的会话和数据库。同会话断线重连保留待确认发送；登出或
   更换身份不能重发旧会话消息，迟到 ACK 不能更新新账号数据库。
 - 同一原始 provider binding 的 RECV 与 EVENT 按 wire 到达顺序处理，anchor 本地落库

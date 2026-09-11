@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
 import 'package:sqflite/sqflite.dart';
 
 import 'package:uuid/uuid.dart';
@@ -668,6 +669,10 @@ class WKMessageManager {
       ensureCurrent();
       final values = MessageDB.shared.getMap(message) as Map<String, dynamic>;
       values['order_seq'] = orderSeq;
+      final originalPayloadSHA256 = sha256.convert(
+        utf8.encode(values['content'] as String)).toString();
+      values['original_payload_sha256'] = originalPayloadSHA256;
+      values['payload_committed'] = 0;
       // A duplicate idempotency key is an error, never a renamed tombstone.
       final clientSeq = await transaction.insert(
         WKDBConst.tableMessage, values,
@@ -676,11 +681,13 @@ class WKMessageManager {
       final conversation = await WKIM.shared.conversationManager.saveWithWKMsg(
         message, 0, database: transaction);
       ensureCurrent();
-      return (clientSeq, orderSeq, conversation);
+      return (clientSeq, orderSeq, conversation, originalPayloadSHA256);
     });
     ensureCurrent();
     message.clientSeq = saved.$1;
     message.orderSeq = saved.$2;
+    message.originalPayloadSHA256 = saved.$4;
+    message.payloadCommitted = false;
     return saved.$3;
   }
 
@@ -756,18 +763,21 @@ class WKMessageManager {
         throw StateError('Attachment upload changed the message identity.');
       }
       final payload = _getSendPayload(uploadedMsg);
+      final sendJson = jsonDecode(payload) as Map<String, dynamic>;
+      sendJson.remove('localPath');
+      sendJson.remove('coverLocalPath');
+      final sendPayload = jsonEncode(sendJson);
+      final originalPayloadSHA256 = sha256.convert(utf8.encode(sendPayload)).toString();
       if (!options.header.noPersist) {
         await MessageDB.shared.updateMsgWithFieldAndClientMsgNo(
-          {'content': payload},
+          {'content': payload, 'original_payload_sha256': originalPayloadSHA256},
           wkMsg.clientMsgNO,
           database: owner.database,
         );
         owner.ensureCurrent();
       }
-      final sendJson = jsonDecode(payload) as Map<String, dynamic>;
-      sendJson.remove('localPath');
-      sendJson.remove('coverLocalPath');
-      uploadedMsg.content = jsonEncode(sendJson);
+      uploadedMsg.content = sendPayload;
+      uploadedMsg.originalPayloadSHA256 = originalPayloadSHA256;
       await WKIM.shared.connectionManager.sendMessage(uploadedMsg);
     } else {
       await WKIM.shared.connectionManager.sendMessage(wkMsg);

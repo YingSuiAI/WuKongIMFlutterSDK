@@ -18,6 +18,9 @@ class WKMsg {
   String applicationMessageID = "";
   /// The body came from reliable RECV/history, not a local send request.
   bool payloadCommitted = false;
+  /// Sender-local proof of the exact original SEND bytes. Empty for received
+  /// or historical rows without locally authored intent evidence.
+  String originalPayloadSHA256 = '';
   int messageSeq = 0;
   int clientSeq = 0;
   int timestamp = 0;

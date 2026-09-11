@@ -1049,6 +1049,7 @@ class WKConnectionManager {
           msg.viewed = WKDBConst.readInt(row, 'viewed');
           msg.viewedAt = WKDBConst.readInt(row, 'viewed_at');
           msg.localExtraMap = WKDBConst.readJsonValue(row, 'extra');
+          msg.originalPayloadSHA256 = WKDBConst.readString(row, 'original_payload_sha256');
         }
         msg.clientSeq = await MessageDB.shared.insert(
           msg,

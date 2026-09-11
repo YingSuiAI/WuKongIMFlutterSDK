@@ -208,7 +208,7 @@ void main() {
 
     expect(
       await WKDatabaseMigrator().migrate(database, migrations),
-      202609111800,
+      202609111801,
     );
 
     expect(await _tables(database), contains('message_reaction'));
@@ -217,7 +217,8 @@ void main() {
 
   test('payload receipt migration preserves admitted local rows', () async {
     final migrations = await _assetMigrations();
-    final preceding = Map<int, String>.from(migrations)..remove(202609111800);
+    final preceding = Map<int, String>.from(migrations)
+      ..remove(202609111800)..remove(202609111801);
     await WKDatabaseMigrator().migrate(database, preceding);
     await database.insert('message', {
       'client_seq': 42,
@@ -235,6 +236,26 @@ void main() {
     await database.update('message', {'payload_committed': 1});
     await WKDatabaseMigrator().migrate(database, migrations);
     expect((await database.query('message')).single['payload_committed'], 1);
+  });
+
+  test('sender-intent migration never derives evidence from existing body', () async {
+    final migrations = await _assetMigrations();
+    final preceding = Map<int, String>.from(migrations)..remove(202609111801);
+    await WKDatabaseMigrator().migrate(database, preceding);
+    await database.insert('message', {
+      'client_msg_no': 'old-peer', 'message_id': '42',
+      'content': '{"type":"message.committed"}', 'payload_committed': 1,
+    });
+    await database.insert('message', {
+      'client_msg_no': 'old-pending', 'message_id': '',
+      'content': '{"type":"message.send"}', 'payload_committed': 0,
+    });
+    final before = await database.query('message', columns: ['content']);
+    await WKDatabaseMigrator().migrate(database, migrations);
+    await WKDatabaseMigrator().migrate(database, migrations);
+    expect(await database.query('message', columns: ['content']), before);
+    final rows = await database.query('message');
+    expect(rows.map((row) => row['original_payload_sha256']), ['', '']);
   });
 
   test('serializes migration replay across database connections', () async {
