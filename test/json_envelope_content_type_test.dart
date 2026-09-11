@@ -6,6 +6,10 @@ import 'package:wukongimfluttersdk/entity/msg.dart';
 import 'package:wukongimfluttersdk/type/const.dart';
 
 void main() {
+  test('request-scoped delivery uses the WKProto temporary channel type', () {
+    expect(WKChannelType.temporary, 8);
+  });
+
   test('project JSON envelope keeps raw content and gets a dedicated type', () {
     final payload = <String, dynamic>{
       'type': 'project.event',

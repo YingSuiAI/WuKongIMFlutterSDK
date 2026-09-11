@@ -22,6 +22,8 @@ class WKChannelType {
   static const customerService = 3;
   static const community = 4;
   static const communityTopic = 5;
+  /// WKProto request-scoped delivery channel, distinct from a business group.
+  static const temporary = 8;
 }
 
 class WKSendMsgResult {
