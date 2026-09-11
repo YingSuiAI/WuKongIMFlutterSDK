@@ -57,9 +57,16 @@ await WKIM.shared.messageManager.sendMessage(
 
 ### 当前协议与生命周期
 
-- 只支持协议 v6 和完整的服务端会话身份，不降级到旧协议。初始化和发送的
+- 只支持协议 v7 和完整的服务端会话身份，不降级到旧协议。初始化和发送的
   Future 必须等待并处理失败；发送 Future 完成不等于服务端已提交，最终结果由
-  与当前发送尝试匹配的 SENDACK 驱动。
+  与当前发送尝试匹配的 SENDACK 或已可靠落库的 source RECV 驱动。
+  必须与对应的 v7 服务端 cohort 配套切换，不能连接仍运行旧传输协议的服务端。
+- SENDACK 的 `applicationMessageID` 是独立的应用消息身份，发送结果监听可直接读取；
+  `messageID` 始终保留 WuKong 原生传输 ID。服务端 canonical RECV 将原请求正文原位
+  升级为不透明的已提交正文，并发布一次新消息通知；重复投递不会重复增加未读或覆盖
+  本地删除/已读状态，已提交正文冲突不会静默覆盖。重启后的应用身份从持久化正文读取。
+  `payloadCommitted` 仅表示传输正文已固定，不代表正文符合某个应用契约；已有历史正文
+  不会被自动转换为 `message.committed`，应用仍需按实际 envelope 类型校验。
 - 异步消息操作绑定发起时的会话和数据库。同会话断线重连保留待确认发送；登出或
   更换身份不能重发旧会话消息，迟到 ACK 不能更新新账号数据库。
 - SQLite 内的 `wk_schema_migrations` 是唯一迁移完成依据。当前数据库可原位重开，

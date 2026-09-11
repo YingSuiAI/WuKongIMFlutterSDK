@@ -191,9 +191,9 @@ class WKConnectionManager {
       return;
     }
     if (WKIM.shared.options.protoVersion != currentProtocolVersion ||
-        !WKIM.shared.options.hasExactV6SessionIdentity) {
+        !WKIM.shared.options.hasExactSessionIdentity) {
       Logs.error(
-        "WKProto v6 requires installationID, appInstanceID, and positive installation/session generations",
+        "WKProto v7 requires installationID, appInstanceID, and positive installation/session generations",
       );
       return;
     }
@@ -554,6 +554,7 @@ class WKConnectionManager {
             pending.databaseClientSeq,
             sendack.messageSeq,
             sendack.reasonCode,
+            applicationMessageID: sendack.applicationMessageID,
             isCurrent: () =>
                 identity == _currentSessionIdentity() &&
                 _isCurrentSocket(generation, connectedSocket),
@@ -884,6 +885,7 @@ class WKConnectionManager {
     msg.channelID = recvMsg.channelID;
     msg.content = recvMsg.payload;
     msg.messageID = recvMsg.messageID.toString();
+    msg.payloadCommitted = true;
     msg.messageSeq = recvMsg.messageSeq;
     msg.timestamp = recvMsg.messageTime;
     msg.fromUID = recvMsg.fromUID;
@@ -923,7 +925,12 @@ class WKConnectionManager {
         msg.setMemberOfFrom(memberChannel);
       }
     }
-    WKIM.shared.messageManager.parsingMsg(msg);
+    WKIM.shared.messageManager.parsingMsg(
+      msg,
+      transportFromUID: recvMsg.fromUID,
+      transportChannelID: recvMsg.channelID,
+      transportChannelType: recvMsg.channelType,
+    );
     if (!isCurrent()) return false;
     if (msg.isDeleted == 0 &&
         !msg.header.noPersist &&
@@ -939,7 +946,6 @@ class WKConnectionManager {
         if (!isCurrent()) throw StateError('The receive session was replaced.');
         final existing = await transaction.query(
           WKDBConst.tableMessage,
-          columns: ['client_seq', 'message_id', 'from_uid'],
           where:
               'channel_id = ? AND channel_type = ? AND '
               '(message_id = ? OR (client_msg_no = ? AND (from_uid = ? OR ? = 1)))',
@@ -955,24 +961,44 @@ class WKConnectionManager {
         );
         if (!isCurrent()) throw StateError('The receive session was replaced.');
         if (existing.isNotEmpty) {
-          final existingMessageID = existing.single['message_id'];
-          if (existingMessageID == msg.messageID) {
+          final row = existing.single;
+          msg.clientSeq = row['client_seq'] as int;
+          final existingMessageID = row['message_id'];
+          final sameMessage = existingMessageID == msg.messageID;
+          // SENDACK can arrive before the server's authoritative source echo.
+          // An ACK only commits identity/status; it does not replace the local
+          // request body with the canonical payload. Keep that payload opaque.
+          if (sameMessage && WKDBConst.readInt(row, 'payload_committed') == 1) {
+            if (row['content'] != msg.content ||
+                row['client_msg_no'] != msg.clientMsgNO) {
+              throw StateError('Conflicting committed message payload.');
+            }
             duplicate = true;
             return null;
           }
           if (!isSelfMessage ||
-              (existingMessageID != '' && existingMessageID != '0')) {
+              row['client_msg_no'] != msg.clientMsgNO ||
+              (!sameMessage &&
+                  existingMessageID != '' &&
+                  existingMessageID != '0')) {
             throw StateError('Conflicting received message identity.');
           }
-          msg.clientSeq = existing.single['client_seq'] as int;
           // Local presentation identity can differ from the opaque wire UID.
-          msg.fromUID = existing.single['from_uid'] as String;
+          msg.fromUID = row['from_uid'] as String;
+          // A source echo must not resurrect a locally deleted message or reset
+          // device-local read/media state while replacing the submitted body.
+          msg.isDeleted = WKDBConst.readInt(row, 'is_deleted');
+          msg.voiceStatus = WKDBConst.readInt(row, 'voice_status');
+          msg.viewed = WKDBConst.readInt(row, 'viewed');
+          msg.viewedAt = WKDBConst.readInt(row, 'viewed_at');
+          msg.localExtraMap = WKDBConst.readJsonValue(row, 'extra');
         }
         msg.clientSeq = await MessageDB.shared.insert(
           msg,
           database: transaction,
         );
         if (!isCurrent()) throw StateError('The receive session was replaced.');
+        if (msg.isDeleted != 0) return null;
         final conversation = await WKIM.shared.conversationManager
             .saveWithWKMsg(
               msg,
@@ -983,6 +1009,15 @@ class WKConnectionManager {
         return conversation;
       });
       if (!isCurrent()) return false;
+      if (isSelfMessage && _sendingIdentity == _currentSessionIdentity()) {
+        // Reliable source delivery is completion evidence even if SENDACK was
+        // lost. Retire only the exact local attempt whose body was committed.
+        _sendingMsgMap.removeWhere((_, pending) =>
+            pending.databaseClientSeq == msg.clientSeq &&
+            pending.sendPacket.clientMsgNO == msg.clientMsgNO &&
+            pending.sendPacket.channelID == msg.channelID &&
+            pending.sendPacket.channelType == msg.channelType);
+      }
       if (duplicate) return true;
       if (uiMsg != null) {
         List<WKUIConversationMsg> list = [];
@@ -994,7 +1029,8 @@ class WKConnectionManager {
         '消息不能存库:is_deleted=${msg.isDeleted},no_persist=${msg.header.noPersist},content_type:${msg.contentType}',
       );
     }
-    if (msg.contentType != WkMessageContentType.insideMsg) {
+    if (msg.isDeleted == 0 &&
+        msg.contentType != WkMessageContentType.insideMsg) {
       List<WKMsg> list = [];
       list.add(msg);
       WKIM.shared.messageManager.pushNewMsg(list);

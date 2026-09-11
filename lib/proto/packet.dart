@@ -105,6 +105,9 @@ class SendPacket extends Packet {
 
 class SendAckPacket extends Packet {
   String messageID = "";
+
+  /// Public application identity, distinct from the native transport messageID.
+  String applicationMessageID = "";
   int clientSeq = 0;
   String clientMsgNO = "";
   int messageSeq = 0;

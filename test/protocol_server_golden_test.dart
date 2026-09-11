@@ -9,17 +9,18 @@ import 'package:wukongimfluttersdk/proto/proto.dart';
 import 'package:wukongimfluttersdk/proto/write_read.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
 
-// Independent oracle: Go codec.New().EncodeFrame(packet, 6) and
-// wkprotoenc.{SendMsgKey,SealRecvPacket} at WuKongIM
-// b52db059a49e309ba164b27496144e0557643fd0. No Dart encoder produced these bytes.
+// Independent v7 oracle: test/fixtures/generate_protocol_golden.go calls the
+// server's actual codec and crypto. SEND/EVENT/uncrypted vectors retain the
+// unchanged v6 layout from b52db059a49e309ba164b27496144e0557643fd0.
+// No Dart encoder produced these golden bytes.
 const _connack =
-    '213006fffffffffffffc1801000a7365727665722d6b6579001066656463626139383736353433323130000000000000002a';
+    '213007fffffffffffffc1801000a7365727665722d6b6579001066656463626139383736353433323130000000000000002a';
 const _send =
     '3f7488010203040009636c69656e742d34320006e4bc9ae8af9d0200000e10002033366538363761623464616630343935646566313032636364323437323134660007746f7069632d31685a493275456a48466b4231397450694830616b454f54516b6f593370746f5870424c5256366d726b79493d';
 const _recv =
     '5a8c018800203865623865643965643866323432343831303162346139393138633831633739000673656e6465720006e4bc9ae8af9d0200000e100009636c69656e742d3432002000000000000100000001000000036aa1f3000007746f7069632d31685a493275456a48466b4231397450694830616b454f54516b6f593370746f5870424c5256366d726b79493d';
 const _sendack =
-    '40200020000000000001010203040000000100000003010009636c69656e742d3432';
+    '40460020000000000001010203040000000100000003010009636c69656e742d3432002430313963303030302d303030302d373030302d383030302d303030303030303030303031';
 
 Uint8List _hex(String value) => Uint8List.fromList(HEX.decode(value));
 
@@ -31,7 +32,7 @@ void main() {
     previousOptions = WKIM.shared.options;
     previousKey = CryptoUtils.aesKey;
     previousSalt = CryptoUtils.salt;
-    WKIM.shared.options = Options()..protoVersion = 6;
+    WKIM.shared.options = Options();
     CryptoUtils.aesKey = '0123456789abcdef';
     CryptoUtils.salt = 'fedcba9876543210';
   });
@@ -45,13 +46,13 @@ void main() {
     final packet = Proto().decode(_hex(_connack)) as ConnackPacket;
     expect(packet.timeDiff, -1000);
     expect(packet.reasonCode, 1);
-    expect(packet.serviceProtoVersion, 6);
+    expect(packet.serviceProtoVersion, 7);
     expect(packet.nodeId, 42);
   });
 
   test('CONNECT identity fields match the deployed Go codec', () {
     final packet = ConnectPacket(
-      version: 6,
+      version: 7,
       deviceFlag: 1,
       deviceID: 'install-1',
       uid: 'u1',
@@ -64,12 +65,12 @@ void main() {
     );
     expect(
       HEX.encode(Proto().encode(packet)),
-      '104506010009696e7374616c6c2d31000275310007746f6b656e2d310000019ff4fc4000000a636c69656e742d6b657900056170702d3100000000000000030000000000000007',
+      '104507010009696e7374616c6c2d31000275310007746f6b656e2d310000019ff4fc4000000a636c69656e742d6b657900056170702d3100000000000000030000000000000007',
     );
   });
 
   test('rejects server protocol downgrade and unimplemented upgrade', () {
-    for (final version in [5, 7]) {
+    for (final version in [5, 6, 8]) {
       final bytes = _hex(_connack)..[2] = version;
       expect(() => Proto().decode(bytes), throwsFormatException);
       expect(
@@ -77,6 +78,16 @@ void main() {
         throwsFormatException,
       );
     }
+  });
+
+  test('successful CONNACK must explicitly declare v7; auth failure need not', () {
+    final original = _hex(_connack);
+    final unversioned = Uint8List.fromList([
+      0x20, original[1] - 1, ...original.sublist(3),
+    ]);
+    expect(() => Proto().decode(unversioned), throwsFormatException);
+    unversioned[10] = 2; // ReasonAuthFail after int64 TimeDiff.
+    expect((Proto().decode(unversioned) as ConnackPacket).reasonCode, 2);
   });
 
   test('EVENT and DISCONNECT match Go and PING/PONG remain header-only', () {
@@ -146,6 +157,7 @@ void main() {
     expect(packet.messageSeq, 0x100000003);
     expect(packet.clientSeq, 0x1020304);
     expect(packet.clientMsgNO, 'client-42');
+    expect(packet.applicationMessageID, '019c0000-0000-7000-8000-000000000001');
     final ack = RecvAckPacket(messageSeq: packet.messageSeq)
       ..messageID = BigInt.parse(packet.messageID);
     expect(

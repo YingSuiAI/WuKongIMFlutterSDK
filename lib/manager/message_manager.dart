@@ -132,7 +132,11 @@ class WKMessageManager {
     return content;
   }
 
-  void parsingMsg(WKMsg wkMsg) {
+  void parsingMsg(WKMsg wkMsg, {
+    String transportFromUID = '',
+    String transportChannelID = '',
+    int transportChannelType = 0,
+  }) {
     if (wkMsg.content == '') {
       wkMsg.contentType = WkMessageContentType.contentFormatError;
       return;
@@ -157,7 +161,12 @@ class WKMessageManager {
           json['channel_id'] = wkMsg.channelID;
           json['channel_type'] = wkMsg.channelType;
         }
-        WKIM.shared.cmdManager.handleCMD(json);
+        WKIM.shared.cmdManager.handleCMD(
+          json,
+          fromUID: transportFromUID,
+          channelID: transportChannelID,
+          channelType: transportChannelType,
+        );
       }
     } catch (e) {
       wkMsg.contentType = WkMessageContentType.contentFormatError;
@@ -838,63 +847,79 @@ class WKMessageManager {
     int clientSeq,
     int messageSeq,
     int reasonCode, {
+    String applicationMessageID = '',
     bool Function()? isCurrent,
   }) async {
     final owner = _MessageOwner();
     bool current() => owner.isCurrent && (isCurrent?.call() ?? true);
     if (owner.database == null || !current()) return;
-    WKMsg? wkMsg = await MessageDB.shared.queryWithClientSeq(
-      clientSeq,
-      database: owner.database,
-    );
-    if (!current()) return;
-    if (wkMsg != null) {
-      wkMsg.messageID = messageID;
-      wkMsg.messageSeq = messageSeq;
-      wkMsg.status = reasonCode;
-      var map = <String, Object>{};
-      map['message_id'] = messageID;
-      map['message_seq'] = messageSeq;
-      map['status'] = reasonCode;
-      int orderSeq = messageSeq == 0
-          ? wkMsg.orderSeq
-          : messageSeq * wkOrderSeqFactor;
-      map['order_seq'] = orderSeq;
-      wkMsg.orderSeq = orderSeq;
-      try {
-        await owner.database!.transaction((transaction) async {
-          void ensureCurrent() {
-            if (!current()) throw const _StaleMessageOperation();
-          }
+    try {
+      final acknowledged = await owner.database!.transaction((
+        transaction,
+      ) async {
+        void ensureCurrent() {
+          if (!current()) throw const _StaleMessageOperation();
+        }
 
-          ensureCurrent();
-          await MessageDB.shared.updateMsgWithField(
-            map,
-            clientSeq,
-            database: transaction,
-          );
-          ensureCurrent();
-          final last = await ConversationDB.shared.queryMsgByMsgChannelId(
-            wkMsg.channelID,
-            wkMsg.channelType,
-            database: transaction,
-          );
-          ensureCurrent();
-          // An older SENDACK must not replace a newer conversation preview.
-          if (last == null || last.lastClientMsgNO == wkMsg.clientMsgNO) {
-            await WKIM.shared.conversationManager.saveWithWKMsg(
-              wkMsg,
-              0,
-              database: transaction,
-            );
+        ensureCurrent();
+        // Read inside the same transaction as the ACK update: a source RECV
+        // may already have replaced the request body while this ACK was queued.
+        final wkMsg = await MessageDB.shared.queryWithClientSeq(
+          clientSeq,
+          database: transaction,
+        );
+        ensureCurrent();
+        if (wkMsg == null) return null;
+        // Reliable source delivery is already positive commit evidence. A late
+        // failed ACK must not erase its native identity or regress its status.
+        if (wkMsg.payloadCommitted) {
+          if (reasonCode != WKSendMsgResult.sendSuccess) return null;
+          if (wkMsg.messageID != messageID || wkMsg.messageSeq != messageSeq) {
+            throw StateError('SENDACK conflicts with committed source identity.');
           }
-          ensureCurrent();
-        });
-      } on _StaleMessageOperation {
-        return;
+        }
+        wkMsg.messageID = messageID;
+        wkMsg.applicationMessageID = applicationMessageID;
+        wkMsg.messageSeq = messageSeq;
+        wkMsg.status = reasonCode;
+        wkMsg.orderSeq = messageSeq == 0
+            ? wkMsg.orderSeq
+            : messageSeq * wkOrderSeqFactor;
+        final map = <String, Object>{
+          'message_id': messageID,
+          'message_seq': messageSeq,
+          'status': reasonCode,
+          'order_seq': wkMsg.orderSeq,
+        };
+        await MessageDB.shared.updateMsgWithField(
+          map,
+          clientSeq,
+          database: transaction,
+        );
+        ensureCurrent();
+        final last = await ConversationDB.shared.queryMsgByMsgChannelId(
+          wkMsg.channelID,
+          wkMsg.channelType,
+          database: transaction,
+        );
+        ensureCurrent();
+        // An older SENDACK must not replace a newer conversation preview.
+        if (wkMsg.isDeleted == 0 &&
+            (last == null || last.lastClientMsgNO == wkMsg.clientMsgNO)) {
+          await WKIM.shared.conversationManager.saveWithWKMsg(
+            wkMsg,
+            0,
+            database: transaction,
+          );
+        }
+        ensureCurrent();
+        return wkMsg;
+      });
+      if (current() && acknowledged != null) {
+        setRefreshMsg(acknowledged);
       }
-      if (!current()) return;
-      setRefreshMsg(wkMsg);
+    } on _StaleMessageOperation {
+      return;
     }
   }
 
@@ -903,10 +928,11 @@ class WKMessageManager {
     if (owner.database == null) return;
     var map = <String, Object>{};
     map['status'] = WKSendMsgResult.sendFail;
-    int row = await MessageDB.shared.updateMsgWithField(
+    int row = await owner.database!.update(
+      WKDBConst.tableMessage,
       map,
-      clientMsgSeq,
-      database: owner.database,
+      where: 'client_seq = ? AND status = ? AND payload_committed = 0',
+      whereArgs: [clientMsgSeq, WKSendMsgResult.sendLoading],
     );
     if (row > 0 && owner.isCurrent) {
       final wkMsg = await MessageDB.shared.queryWithClientSeq(

@@ -30,7 +30,7 @@ class WKIM {
 
   Future<bool> setup(Options opts) async {
     if (opts.protoVersion != currentProtocolVersion ||
-        !opts.hasExactV6SessionIdentity) {
+        !opts.hasExactSessionIdentity) {
       return false;
     }
     final generation = ++_setupGeneration;

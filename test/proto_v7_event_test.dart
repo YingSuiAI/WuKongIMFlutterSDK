@@ -13,7 +13,7 @@ import 'package:wukongimfluttersdk/wkim.dart';
 
 void main() {
   setUp(() {
-    WKIM.shared.options = Options()..protoVersion = 6;
+    WKIM.shared.options = Options();
   });
 
   test('decodes the Go EVENT golden frame', () {
@@ -29,7 +29,7 @@ void main() {
     expect(packet.data, 'test'.codeUnits);
   });
 
-  test('uses uint64 message sequence fields in protocol v6', () {
+  test('uses uint64 message sequence fields in protocol v7', () {
     const sequence = 0x100000001;
     final ack = RecvAckPacket()
       ..messageID = BigInt.one
@@ -41,9 +41,9 @@ void main() {
     expect(HEX.encode(encoded.sublist(10)), '0000000100000001');
   });
 
-  test('encodes both installation and session generations in v6 CONNECT', () {
+  test('encodes both installation and session generations in v7 CONNECT', () {
     final packet = ConnectPacket(
-      version: 6,
+      version: 7,
       deviceFlag: 1,
       deviceID: 'install-1',
       uid: 'u1',
@@ -59,7 +59,7 @@ void main() {
     final reader = ReadData(encoded);
     expect(reader.readUint8() >> 4, PacketType.connect.index);
     expect(reader.readVariableLength(), reader.remainingLength);
-    expect(reader.readUint8(), 6);
+    expect(reader.readUint8(), 7);
     expect(reader.readUint8(), 1);
     expect(reader.readString(), 'install-1');
     expect(reader.readString(), 'u1');
@@ -73,9 +73,9 @@ void main() {
     expect(reader.remainingLength, 0);
   });
 
-  test('pre-v6 CONNECT is rejected instead of encoding legacy identity', () {
+  test('pre-v7 CONNECT is rejected instead of encoding legacy identity', () {
     final packet = ConnectPacket(
-      version: 5,
+      version: 6,
       deviceID: 'legacy-device',
       uid: 'legacy-user',
       token: 'legacy-token',
@@ -89,20 +89,21 @@ void main() {
     expect(() => Proto().encode(packet), throwsFormatException);
   });
 
-  test('decodes the optional SENDACK client message number suffix', () {
+  test('decodes required SENDACK client number and application ID fields', () {
     final frame = Uint8List.fromList(
       HEX.decode(
-        '40200000000000000001000000020000000100000003010009636c69656e742d3432',
+        '40501d0ce0014bc01000000000110020000000000001010013636c69656e742d6d6573736167652d30303031002430313963303030302d303030302d373030302d383030302d303030303030303030303031',
       ),
     );
 
     final packet = Proto().decode(frame) as SendAckPacket;
 
-    expect(packet.messageID, '1');
-    expect(packet.clientSeq, 2);
-    expect(packet.messageSeq, 0x100000003);
+    expect(packet.messageID, '2093294222990905344');
+    expect(packet.clientSeq, 17);
+    expect(packet.messageSeq, 9007199254740993);
     expect(packet.reasonCode, 1);
-    expect(packet.clientMsgNO, 'client-42');
+    expect(packet.clientMsgNO, 'client-message-0001');
+    expect(packet.applicationMessageID, '019c0000-0000-7000-8000-000000000001');
   });
 
   test('decodes an unknown frame without throwing', () {
@@ -113,16 +114,43 @@ void main() {
     expect((packet as UnknownPacket).data, [0x2a]);
   });
 
+  test('failed v7 ACK carries both empty identity fields', () {
+    final packet =
+        Proto().decode(
+              Uint8List.fromList(
+                HEX.decode(
+                  '401900000000000000000000001100000000000000000200000000',
+                ),
+              ),
+            )
+            as SendAckPacket;
+    expect(packet.reasonCode, 2);
+    expect(packet.clientMsgNO, isEmpty);
+    expect(packet.applicationMessageID, isEmpty);
+  });
+
+  test(
+    'v7 rejects truncated legacy ACKs and successful empty application ID',
+    () {
+      for (final hex in [
+        '4015000000000000000100000002000000010000000301',
+        '40200000000000000001000000020000000100000003010009636c69656e742d3432',
+        '40220000000000000001000000020000000100000003010009636c69656e742d34320000',
+      ]) {
+        expect(
+          () => Proto().decode(Uint8List.fromList(HEX.decode(hex))),
+          throwsFormatException,
+        );
+      }
+    },
+  );
+
   test('connection manager dispatches one copy of a repeated EVENT', () {
     final manager = WKConnectionManager.shared;
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
     manager.addOnEventListener('proto-v6-test', received.add);
-    final event = _event(
-      id: 'evt-connection',
-      type: 'open',
-      sequence: 1,
-    );
+    final event = _event(id: 'evt-connection', type: 'open', sequence: 1);
     final frame = _encodeEventFrame(event);
 
     manager.testCutData(Uint8List.fromList([...frame, ...frame]));
@@ -182,10 +210,7 @@ void main() {
           'event_type': 'delta',
           'event_key': key,
           'msg_event_seq': sequence,
-          'payload': {
-            'authority_sequence': sequence,
-            'text_delta': 'hello',
-          },
+          'payload': {'authority_sequence': sequence, 'text_delta': 'hello'},
         }),
       );
 
@@ -422,37 +447,33 @@ void main() {
     manager.setGapListener(null);
   });
 
-  test('first sequence after reset remains a gap when it is greater than one',
-      () {
-    final manager = WKEventManager.shared;
-    manager.reset();
-    final received = <EventPacket>[];
-    final gaps = <WKEventGap>[];
-    manager.addListener('reset-gap-test', received.add);
-    manager.setGapListener(gaps.add);
+  test(
+    'first sequence after reset remains a gap when it is greater than one',
+    () {
+      final manager = WKEventManager.shared;
+      manager.reset();
+      final received = <EventPacket>[];
+      final gaps = <WKEventGap>[];
+      manager.addListener('reset-gap-test', received.add);
+      manager.setGapListener(gaps.add);
 
-    manager.handle(
-      _event(id: 'evt-after-reset', type: 'delta', sequence: 2),
-    );
+      manager.handle(_event(id: 'evt-after-reset', type: 'delta', sequence: 2));
 
-    expect(received, isEmpty);
-    expect(gaps, hasLength(1));
-    expect(gaps.single.expectedMsgEventSequence, 1);
-    expect(gaps.single.receivedMsgEventSequence, 2);
-    manager.removeListener('reset-gap-test');
-    manager.setGapListener(null);
-  });
+      expect(received, isEmpty);
+      expect(gaps, hasLength(1));
+      expect(gaps.single.expectedMsgEventSequence, 1);
+      expect(gaps.single.receivedMsgEventSequence, 2);
+      manager.removeListener('reset-gap-test');
+      manager.setGapListener(null);
+    },
+  );
 
   test('finish terminates every lane in the run', () {
     final manager = WKEventManager.shared;
     manager.reset();
     final received = <EventPacket>[];
     manager.addListener('run-finish-test', received.add);
-    final finish = _event(
-      id: 'evt-finish',
-      type: 'finish',
-      sequence: 7,
-    );
+    final finish = _event(id: 'evt-finish', type: 'finish', sequence: 7);
     manager.restoreRunTransportWatermark(9001, 'run-42', 6);
     manager.handle(finish);
 
@@ -489,57 +510,51 @@ void main() {
     manager.removeListener('anchor-isolation-test');
   });
 
-  test('transport recovery never uses or stores Platform authority sequence',
-      () {
-    final manager = WKEventManager.shared;
-    manager.reset();
-    final received = <EventPacket>[];
-    manager.addListener('recover-monotonic-test', received.add);
-    expect(
-      manager.restoreRunTransportWatermark(
-        9001,
-        'run-recover-monotonic',
-        5,
-      ),
-      isTrue,
-    );
-    expect(
-      manager.restoreRunTransportWatermark(
-        9001,
-        'run-recover-monotonic',
-        3,
-      ),
-      isFalse,
-    );
-    manager.handle(
-      _event(
-        id: 'evt-stale-after-recovery',
-        type: 'delta',
-        sequence: 4,
-        runID: 'run-recover-monotonic',
-      ),
-    );
-    expect(
-      manager.restoreRunTransportWatermark(
-        9001,
-        'run-recover-monotonic',
-        6,
-        terminal: true,
-      ),
-      isTrue,
-    );
-    manager.handle(
-      _event(
-        id: 'evt-after-terminal-recovery',
-        type: 'delta',
-        sequence: 7,
-        runID: 'run-recover-monotonic',
-      ),
-    );
+  test(
+    'transport recovery never uses or stores Platform authority sequence',
+    () {
+      final manager = WKEventManager.shared;
+      manager.reset();
+      final received = <EventPacket>[];
+      manager.addListener('recover-monotonic-test', received.add);
+      expect(
+        manager.restoreRunTransportWatermark(9001, 'run-recover-monotonic', 5),
+        isTrue,
+      );
+      expect(
+        manager.restoreRunTransportWatermark(9001, 'run-recover-monotonic', 3),
+        isFalse,
+      );
+      manager.handle(
+        _event(
+          id: 'evt-stale-after-recovery',
+          type: 'delta',
+          sequence: 4,
+          runID: 'run-recover-monotonic',
+        ),
+      );
+      expect(
+        manager.restoreRunTransportWatermark(
+          9001,
+          'run-recover-monotonic',
+          6,
+          terminal: true,
+        ),
+        isTrue,
+      );
+      manager.handle(
+        _event(
+          id: 'evt-after-terminal-recovery',
+          type: 'delta',
+          sequence: 7,
+          runID: 'run-recover-monotonic',
+        ),
+      );
 
-    expect(received, isEmpty);
-    manager.removeListener('recover-monotonic-test');
-  });
+      expect(received, isEmpty);
+      manager.removeListener('recover-monotonic-test');
+    },
+  );
 }
 
 EventPacket _event({
@@ -551,29 +566,28 @@ EventPacket _event({
   String eventKey = 'main',
   int? authoritySequence,
   String snapshotState = 'running',
-}) =>
-    EventPacket()
-      ..eventID = id
-      ..eventType = type
-      ..timestamp = 1786521600000
-      ..data = utf8.encode(
-        jsonEncode({
-          'message_id': messageID,
-          'run_id': runID,
-          'event_type': type,
-          'event_key': eventKey,
-          'msg_event_seq': sequence,
-          'payload': type == 'delta'
-              ? {
-                  'authority_sequence': authoritySequence ?? sequence,
-                  'text_delta': 'hello',
-                }
-              : {
-                  'authority_sequence': authoritySequence ?? sequence,
-                  'snapshot': {'state': snapshotState, 'text': 'hello'},
-                },
-        }),
-      );
+}) => EventPacket()
+  ..eventID = id
+  ..eventType = type
+  ..timestamp = 1786521600000
+  ..data = utf8.encode(
+    jsonEncode({
+      'message_id': messageID,
+      'run_id': runID,
+      'event_type': type,
+      'event_key': eventKey,
+      'msg_event_seq': sequence,
+      'payload': type == 'delta'
+          ? {
+              'authority_sequence': authoritySequence ?? sequence,
+              'text_delta': 'hello',
+            }
+          : {
+              'authority_sequence': authoritySequence ?? sequence,
+              'snapshot': {'state': snapshotState, 'text': 'hello'},
+            },
+    }),
+  );
 
 Uint8List _encodeEventFrame(EventPacket event) {
   final body = _eventBody(event);

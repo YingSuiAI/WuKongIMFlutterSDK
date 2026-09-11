@@ -208,11 +208,33 @@ void main() {
 
     expect(
       await WKDatabaseMigrator().migrate(database, migrations),
-      202604271625,
+      202609111800,
     );
 
     expect(await _tables(database), contains('message_reaction'));
     expect(await _versions(database), migrations.keys.toList()..sort());
+  });
+
+  test('payload receipt migration preserves admitted local rows', () async {
+    final migrations = await _assetMigrations();
+    final preceding = Map<int, String>.from(migrations)..remove(202609111800);
+    await WKDatabaseMigrator().migrate(database, preceding);
+    await database.insert('message', {
+      'client_seq': 42,
+      'client_msg_no': 'retained-request',
+      'content': '{"type":"message.send"}',
+      'is_deleted': 1,
+    });
+    await WKDatabaseMigrator().migrate(database, migrations);
+    final row = (await database.query('message')).single;
+    expect(row['client_seq'], 42);
+    expect(row['client_msg_no'], 'retained-request');
+    expect(row['content'], '{"type":"message.send"}');
+    expect(row['is_deleted'], 1);
+    expect(row['payload_committed'], 0);
+    await database.update('message', {'payload_committed': 1});
+    await WKDatabaseMigrator().migrate(database, migrations);
+    expect((await database.query('message')).single['payload_committed'], 1);
   });
 
   test('serializes migration replay across database connections', () async {
@@ -291,6 +313,7 @@ Future<List<int>> _versions(Database database) async {
 Future<Map<int, String>> _assetMigrations() async {
   final versions = (await File('assets/sql.txt').readAsString())
       .split(';')
+      .map((value) => value.trim())
       .where((value) => value.isNotEmpty)
       .map(int.parse);
   return {

@@ -310,6 +310,7 @@ BEGIN SELECT RAISE(FAIL, 'test projection failure'); END
         ..fromUID = 'product-principal'
         ..channelID = 'peer';
       final localSeq = await originalMessages.saveMsg(outgoing);
+      await originalMessages.updateSendResult('43', localSeq, 11, 1);
       proto.nextPacket = receive()
         ..messageID = BigInt.from(43)
         ..messageSeq = 11
@@ -325,6 +326,7 @@ BEGIN SELECT RAISE(FAIL, 'test projection failure'); END
       expect(echo.single['from_uid'], 'product-principal');
       expect(echo.single['client_msg_no'], 'own-echo');
       expect(echo.single['message_id'], '43');
+      expect(echo.single['content'], '{"type":1,"content":"received"}');
       expect(await db.query('message'), hasLength(2));
       expect((await db.query('conversation')).single['unread_count'], 1);
     },
@@ -404,6 +406,7 @@ class _Messages implements WKMessageManager {
     int clientSeq,
     int messageSeq,
     int reasonCode, {
+    String applicationMessageID = '',
     bool Function()? isCurrent,
   }) async {
     ackAttempts++;

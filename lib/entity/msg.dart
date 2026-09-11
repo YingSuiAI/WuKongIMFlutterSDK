@@ -13,6 +13,11 @@ class WKMsg {
   MessageHeader header = MessageHeader();
   Setting setting = Setting();
   String messageID = "";
+  /// The public ID returned by SENDACK, available on the send-result callback.
+  /// Persisted application content remains the source of truth after restart.
+  String applicationMessageID = "";
+  /// The body came from reliable RECV/history, not a local send request.
+  bool payloadCommitted = false;
   int messageSeq = 0;
   int clientSeq = 0;
   int timestamp = 0;
@@ -156,6 +161,7 @@ class WKSyncMsg {
     msg.channelID = channelID;
     msg.channelType = channelType;
     msg.messageID = messageID;
+    msg.payloadCommitted = true;
     msg.messageSeq = messageSeq;
     msg.clientMsgNO = clientMsgNO;
     msg.fromUID = fromUID;
