@@ -69,6 +69,8 @@ await WKIM.shared.messageManager.sendMessage(
   不会被自动转换为 `message.committed`，应用仍需按实际 envelope 类型校验。
 - 异步消息操作绑定发起时的会话和数据库。同会话断线重连保留待确认发送；登出或
   更换身份不能重发旧会话消息，迟到 ACK 不能更新新账号数据库。
+- 同一原始 provider binding 的 RECV 与 EVENT 按 wire 到达顺序处理，anchor 本地落库
+  后才交付后续事件；不同 binding 不互相等待。断开或更换身份后不交付旧连接的排队事件。
 - SQLite 内的 `wk_schema_migrations` 是唯一迁移完成依据。当前数据库可原位重开，
   新数据库按事务初始化；无此 ledger 的旧业务数据库不受支持，不读取旧偏好水位，
   也不会自动清库或改路径。初始化失败必须交回调用方处理。

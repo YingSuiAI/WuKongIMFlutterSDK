@@ -137,11 +137,12 @@ void main() {
     peer.add(_frame(0x40, body));
   }
 
-  void echo({
+  Uint8List echo({
     String content = _canonical,
     String fromUID = 'transport-owner',
     String channelID = 'peer',
     bool noPersist = false,
+    bool sendFrame = true,
   }) {
     final encrypted = CryptoUtils.aesEncrypt(content);
     final key = CryptoUtils.generateMD5(
@@ -161,7 +162,37 @@ void main() {
       ..writeUint64(BigInt.from(10))
       ..writeUint32(1788899200)
       ..writeBytes(utf8.encode(encrypted));
-    peer.add(_frame(noPersist ? 0x51 : 0x52, body));
+    final frame = _frame(noPersist ? 0x51 : 0x52, body);
+    if (sendFrame) peer.add(frame);
+    return frame;
+  }
+
+  Uint8List eventFrame(
+    String type,
+    int sequence, {
+    String channelID = 'peer',
+    int messageID = 42,
+  }) {
+    final body = WriteData()
+      ..writeString('event-$channelID-$sequence')
+      ..writeString(type)
+      ..writeUint64(BigInt.from(1788899200000))
+      ..writeBytes(
+        utf8.encode(
+          jsonEncode({
+            'message_id': messageID,
+            'client_msg_no': 'request-$messageID',
+            'channel_id': channelID,
+            'channel_type': 1,
+            'run_id': 'run-$messageID',
+            'event_type': type,
+            'event_key': 'event-$sequence',
+            'msg_event_seq': sequence,
+            'payload': {'authority_sequence': sequence},
+          }),
+        ),
+      );
+    return _frame(0xc0, body);
   }
 
   Future<void> migrateOldRow(Map<String, Object?> row) async {
@@ -449,6 +480,132 @@ void main() {
       expect(commands.single.channelID, 'transport-owner');
     },
   );
+  test(
+    'coalesced RECV anchor must publish before its following EVENTs',
+    () async {
+      final order = <String>[];
+      final observedAnchors = <Future<WKMsg?>>[];
+      sdk.messageManager.addOnNewMsgListener('wire-order-review', (_) {
+        order.add('message');
+      });
+      sdk.connectionManager.addOnEventListener('wire-order-review', (event) {
+        order.add('event:${event.eventType}');
+        observedAnchors.add(
+          MessageDB.shared.queryWithClientMsgNo('request-42'),
+        );
+      });
+      addTearDown(() {
+        sdk.messageManager.removeNewMsgListener('wire-order-review');
+        sdk.connectionManager.removeOnEventListener('wire-order-review');
+      });
+      // One TCP write containing a verified encrypted anchor followed by the
+      // corresponding open/delta packets, exactly in server wire order.
+      peer.add([
+        ...echo(sendFrame: false),
+        ...eventFrame('open', 1),
+        ...eventFrame('delta', 2),
+      ]);
+      await _until(() => proto.receiveAcks == 1 && order.length == 3);
+      final anchors = await Future.wait(observedAnchors);
+      expect(
+        order,
+        ['message', 'event:open', 'event:delta'],
+        reason:
+            'anchor rows visible at event callbacks: ${anchors.map((row) => row?.messageID).toList()}',
+      );
+    },
+  );
+
+  test(
+    'slow RECV storage holds only its own provider binding EVENTs',
+    () async {
+      final events = <String>[];
+      sdk.connectionManager.addOnEventListener('binding-isolation', (event) {
+        events.add(event.decodeJsonData()!['channel_id'] as String);
+      });
+      addTearDown(
+        () => sdk.connectionManager.removeOnEventListener('binding-isolation'),
+      );
+      final entered = Completer<void>();
+      final release = Completer<void>();
+      final held = WKDBHelper.shared.getDB()!.transaction((_) async {
+        entered.complete();
+        await release.future;
+      });
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await held;
+      });
+      await entered.future;
+      final malformed = WriteData()
+        ..writeString('bad-event')
+        ..writeString('delta')
+        ..writeUint64(BigInt.one)
+        ..writeBytes(utf8.encode('{"channel_id":12,"channel_type":"bad"}'));
+      peer.add([
+        ...echo(sendFrame: false),
+        ...eventFrame('open', 1),
+        ..._frame(0xc0, malformed),
+        0xf0,
+        0x01,
+        0x2a, // Unknown frame must not become a shared queue/barrier.
+        ...eventFrame('open', 1, channelID: 'other-binding', messageID: 43),
+      ]);
+      await _until(() => events.contains('other-binding'));
+      expect(events, ['other-binding']);
+      expect(delivered, isEmpty);
+      release.complete();
+      await held;
+      await _until(() => proto.receiveAcks == 1 && events.length == 2);
+      expect(events, ['other-binding', 'peer']);
+    },
+  );
+
+  for (final replaceSession in [false, true]) {
+    test(
+      'queued EVENT cancels after ${replaceSession ? 'identity replacement' : 'disconnect'}',
+      () async {
+        final events = <EventPacket>[];
+        sdk.connectionManager.addOnEventListener('queue-owner', events.add);
+        addTearDown(
+          () => sdk.connectionManager.removeOnEventListener('queue-owner'),
+        );
+        final entered = Completer<void>();
+        final release = Completer<void>();
+        final held = WKDBHelper.shared.getDB()!.transaction((_) async {
+          entered.complete();
+          await release.future;
+        });
+        addTearDown(() async {
+          if (!release.isCompleted) release.complete();
+          await held;
+        });
+        await entered.future;
+        peer.add([...echo(sendFrame: false), ...eventFrame('open', 1)]);
+        await _until(() => proto.recvs == 1 && proto.events == 1);
+        if (replaceSession) {
+          sdk.options.sessionGeneration++;
+        } else {
+          sdk.connectionManager.disconnect(false);
+        }
+        release.complete();
+        await held;
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        expect(events, isEmpty);
+        expect(delivered, isEmpty);
+        expect(proto.receiveAcks, 0);
+        expect(await WKDBHelper.shared.getDB()!.query('message'), isEmpty);
+
+        sdk.connectionManager.connect();
+        await _until(() => proto.connects == 2 && sockets.length == 2);
+        authenticate();
+        await _until(() => proto.connacks == 2);
+        peer.add(eventFrame('open', 1));
+        await _until(() => events.length == 1);
+        expect(events.single.eventID, 'event-peer-1');
+      },
+    );
+  }
 }
 
 class _ObservedProto extends Proto {
@@ -456,6 +613,7 @@ class _ObservedProto extends Proto {
   int connacks = 0;
   int recvs = 0;
   int sendacks = 0;
+  int events = 0;
   int receiveAcks = 0;
   final sends = <SendPacket>[];
 
@@ -474,6 +632,7 @@ class _ObservedProto extends Proto {
     if (packet is ConnackPacket) connacks++;
     if (packet is RecvPacket) recvs++;
     if (packet is SendAckPacket) sendacks++;
+    if (packet is EventPacket) events++;
     return packet;
   }
 }

@@ -145,7 +145,7 @@ void main() {
     },
   );
 
-  test('connection manager dispatches one copy of a repeated EVENT', () {
+  test('connection manager dispatches one copy of a repeated EVENT', () async {
     final manager = WKConnectionManager.shared;
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
@@ -154,12 +154,13 @@ void main() {
     final frame = _encodeEventFrame(event);
 
     manager.testCutData(Uint8List.fromList([...frame, ...frame]));
+    await Future<void>.delayed(Duration.zero);
 
     expect(received, hasLength(1));
     manager.removeOnEventListener('proto-v6-test');
   });
 
-  test('socket parser skips a short unknown frame and continues', () {
+  test('socket parser skips a short unknown frame and continues', () async {
     final manager = WKConnectionManager.shared;
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
@@ -169,12 +170,13 @@ void main() {
     );
 
     manager.testCutData(Uint8List.fromList([0xf0, 0x01, 0x2a, ...event]));
+    await Future<void>.delayed(Duration.zero);
 
     expect(received, hasLength(1));
     manager.removeOnEventListener('unknown-frame-test');
   });
 
-  test('socket parser waits for a split remaining-length header', () {
+  test('socket parser waits for a split remaining-length header', () async {
     final manager = WKConnectionManager.shared;
     WKEventManager.shared.reset();
     final received = <EventPacket>[];
@@ -187,6 +189,7 @@ void main() {
     manager.testCutData(frame.sublist(0, 2));
     expect(received, isEmpty);
     manager.testCutData(frame.sublist(2));
+    await Future<void>.delayed(Duration.zero);
 
     expect(received, hasLength(1));
     manager.removeOnEventListener('split-header-test');
@@ -573,6 +576,8 @@ EventPacket _event({
   ..data = utf8.encode(
     jsonEncode({
       'message_id': messageID,
+      'channel_id': 'peer',
+      'channel_type': 1,
       'run_id': runID,
       'event_type': type,
       'event_key': eventKey,

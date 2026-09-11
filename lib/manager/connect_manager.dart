@@ -134,6 +134,8 @@ class WKConnectionManager {
   final checkNetworkSecond = const Duration(seconds: 1);
   int unReceivePongCount = 0;
   final LinkedHashMap<int, SendingMsg> _sendingMsgMap = LinkedHashMap();
+  final Map<(Object, int, _WKSocket?, int, String), Future<void>>
+  _incomingTails = {};
   HashMap<String, Function(int, int?, ConnectionInfo?)>? _connectionListenerMap;
   _WKSocket? _socket;
   _WKSocket? _authenticatedSocket;
@@ -529,12 +531,17 @@ class WKConnectionManager {
         Logs.debug('连接失败！错误->${connackPacket.reasonCode}');
       }
     } else if (packet.header.packetType == PacketType.recv) {
-      unawaited(
-        _receiveMessage(
-          packet as RecvPacket,
+      final recv = packet as RecvPacket;
+      _enqueueIncoming(
+        recv.channelID,
+        recv.channelType,
+        () => _receiveMessage(
+          recv,
           generation: generation,
           connectedSocket: connectedSocket,
         ),
+        generation: generation,
+        connectedSocket: connectedSocket,
       );
     } else if (packet.header.packetType == PacketType.sendack) {
       var sendack = packet as SendAckPacket;
@@ -571,12 +578,61 @@ class WKConnectionManager {
         }
       }());
     } else if (packet.header.packetType == PacketType.event) {
-      WKEventManager.shared.handle(packet as EventPacket);
+      final event = packet as EventPacket;
+      final envelope = event.decodeJsonData();
+      final channelID = envelope?['channel_id'];
+      final channelType = envelope?['channel_type'];
+      if (channelID is! String || channelType is! int) return;
+      _enqueueIncoming(
+        channelID,
+        channelType,
+        () => WKEventManager.shared.handle(event),
+        generation: generation,
+        connectedSocket: connectedSocket,
+      );
     } else if (packet.header.packetType == PacketType.disconnect) {
       _disconnect(true, WKConnectStatus.kicked);
     } else if (packet.header.packetType == PacketType.pong) {
       Logs.info('pong...');
     }
+  }
+
+  void _enqueueIncoming(
+    String channelID,
+    int channelType,
+    FutureOr<void> Function() operation, {
+    int? generation,
+    _WKSocket? connectedSocket,
+  }) {
+    if (channelID.trim().isEmpty || channelType < 1 || channelType > 255) {
+      return;
+    }
+    // Capture ownership at wire arrival, before a preceding RECV's SQLite
+    // awaits. App callbacks cannot reconstruct ordering once EVENT overtakes it.
+    final identity = _currentSessionIdentity();
+    final lifecycle = _lifecycleGeneration;
+    final socket = connectedSocket ?? _socket;
+    final database = WKDBHelper.shared.getDB();
+    final key = (identity, lifecycle, socket, channelType, channelID);
+    late final Future<void> tail;
+    tail = (_incomingTails[key] ?? Future<void>.value())
+        .then<void>((_) async {
+          if (identity != _currentSessionIdentity() ||
+              lifecycle != _lifecycleGeneration ||
+              !identical(socket, _socket) ||
+              !identical(database, WKDBHelper.shared.getDB()) ||
+              !_isCurrentSocket(generation, connectedSocket)) {
+            return;
+          }
+          await operation();
+        })
+        .catchError((Object error, StackTrace stack) {
+          Logs.debug('接收队列处理失败: ${error.runtimeType}');
+        })
+        .whenComplete(() {
+          if (identical(_incomingTails[key], tail)) _incomingTails.remove(key);
+        });
+    _incomingTails[key] = tail;
   }
 
   _closeAll() {
@@ -590,6 +646,7 @@ class WKConnectionManager {
   }
 
   void _closeAllTransport() {
+    _incomingTails.clear();
     _cacheData = null;
     _authenticatedSocket = null;
     if (_socket != null) {
