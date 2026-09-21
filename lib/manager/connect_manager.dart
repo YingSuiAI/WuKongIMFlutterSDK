@@ -224,6 +224,26 @@ class WKConnectionManager {
 
   void disconnect(bool isLogout) => _disconnect(isLogout, WKConnectStatus.fail);
 
+  /// Retires the socket that belongs to the previous credential generation.
+  ///
+  /// `WKIM.setup` replaces [Options] before the next [connect] call.  Leaving
+  /// the old socket alive in that gap lets a delayed disconnect/KICK from the
+  /// superseded session be reported as if it belonged to the new session.
+  /// Advance the lifecycle first so every callback captured by the old socket
+  /// becomes stale, but do not publish a terminal connection status: the
+  /// caller is about to establish the replacement session.
+  void prepareForSessionSetup() {
+    _wantsConnection = false;
+    isDisconnection = true;
+    ++_lifecycleGeneration;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    isNetworkUnavailable = false;
+    isReconnection = false;
+    lastConnectivityResult = null;
+    _closeAll();
+  }
+
   void _disconnect(bool isLogout, int status) {
     _wantsConnection = false;
     isDisconnection = true;
@@ -846,6 +866,9 @@ class WKConnectionManager {
     if (uid == null || uid.isEmpty) {
       throw StateError('Sending requires an authenticated session identity.');
     }
+    if (!isReadyForSending) {
+      throw StateError('Sending requires an authenticated socket.');
+    }
     _selectSendingSession(identity);
     SendPacket packet = SendPacket();
     packet.setting = wkMsg.setting;
@@ -866,6 +889,19 @@ class WKConnectionManager {
     _addSendingMsg(packet, wkMsg.clientSeq);
     await _sendPacket(packet, propagateError: true);
   }
+
+  /// Whether a SEND packet can be written immediately to the current session.
+  ///
+  /// Local persistence is not proof of transport admission. Exposing a
+  /// message as pending while the socket is retired or reconnecting leaves
+  /// callers with a permanently optimistic message and no usable retry
+  /// signal. SEND callers must retry after a fresh authenticated connection.
+  bool get isReadyForSending =>
+      !isDisconnection &&
+      !isReconnection &&
+      _isCurrent(_lifecycleGeneration) &&
+      _socket != null &&
+      identical(_authenticatedSocket, _socket);
 
   void _selectSendingSession(_SessionIdentity identity) {
     if (_sendingIdentity != identity) {
