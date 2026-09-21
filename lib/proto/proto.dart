@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'packet.dart';
 import 'write_read.dart';
 
-const currentProtocolVersion = 6;
+const currentProtocolVersion = 7;
 
 enum PacketType {
   reserved, // 保留位
@@ -100,7 +100,7 @@ class Proto {
 
 Uint8List encodeConnect(ConnectPacket packet) {
   if (packet.version != currentProtocolVersion) {
-    throw const FormatException('WKProto requires protocol version 6');
+    throw const FormatException('WKProto requires protocol version 7');
   }
   WriteData write = WriteData();
   write.writeUint8(packet.version);
@@ -122,11 +122,14 @@ decodeConnack(PacketHeader header, ReadData reader) {
   if (header.hasServerVersion) {
     var version = reader.readByte();
     if (version != currentProtocolVersion) {
-      throw const FormatException('WKProto requires server protocol version 6');
+      throw const FormatException('WKProto requires server protocol version 7');
     }
   }
   connAck.timeDiff = reader.readInt64();
   connAck.reasonCode = reader.readUint8();
+  if (connAck.reasonCode == 1 && !header.hasServerVersion) {
+    throw const FormatException('Successful CONNACK requires server version 7');
+  }
   connAck.serverKey = reader.readString();
   connAck.salt = reader.readString();
   connAck.nodeId = reader.readUint64AsInt();
@@ -223,12 +226,16 @@ Uint8List encodeRecvAck(RecvAckPacket packet) {
 SendAckPacket decodeSendAck(PacketHeader header, ReadData reader) {
   var sendack = SendAckPacket();
   sendack.header = header;
-  sendack.messageID = reader.readUint64().toString();
+  sendack.messageID = reader.readUint64().toSigned(64).toString();
   sendack.clientSeq = reader.readUint32();
   sendack.messageSeq = reader.readUint64AsInt();
   sendack.reasonCode = reader.readUint8();
-  if (reader.remainingLength > 0) {
-    sendack.clientMsgNO = reader.readString();
+  sendack.clientMsgNO = reader.readString();
+  sendack.applicationMessageID = reader.readString();
+  if (sendack.reasonCode == 1 && sendack.applicationMessageID.isEmpty) {
+    throw const FormatException(
+      'Successful SENDACK requires application identity',
+    );
   }
   return sendack;
 }

@@ -74,7 +74,7 @@ void main() {
         }
       });
       final connack = WriteData()
-        ..writeUint8(6)
+        ..writeUint8(7)
         ..writeUint64(BigInt.zero)
         ..writeUint8(1)
         ..writeString(base64Encode(CryptoUtils.dhPublicKey!))
@@ -147,7 +147,7 @@ void main() {
     await _eventually(() => clients.length == 1);
   });
 
-  test('protocol v6 fails closed without exact session identity', () async {
+  test('protocol v7 fails closed without exact session identity', () async {
     WKIM.shared.options.installationID = null;
 
     WKIM.shared.connectionManager.connect();
@@ -156,7 +156,7 @@ void main() {
     expect(clients, isEmpty);
   });
 
-  test('protocol v6 setup rejects a missing installation identity', () async {
+  test('protocol v7 setup rejects a missing installation identity', () async {
     final previous = WKIM.shared.options;
     final accepted = await WKIM.shared.setup(
       Options.newDefault('setup-user', 'setup-token', addr: previous.addr)

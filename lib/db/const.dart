@@ -45,6 +45,8 @@ class WKDBConst {
   static WKMsg serializeWKMsg(dynamic data) {
     WKMsg msg = WKMsg();
     msg.messageID = readString(data, 'message_id');
+    msg.payloadCommitted = readInt(data, 'payload_committed') == 1;
+    msg.originalPayloadSHA256 = readString(data, 'original_payload_sha256');
     msg.messageSeq = readInt(data, 'message_seq');
     msg.clientSeq = readInt(data, 'client_seq');
     msg.timestamp = readInt(data, 'timestamp');

@@ -3,7 +3,7 @@ import '../proto/proto.dart';
 class Options {
   String? uid, token;
   String? addr; // connect address IP:PORT
-  int protoVersion = 0x06; // protocol version
+  int protoVersion = currentProtocolVersion;
   int deviceFlag = 0;
   String? installationID;
   String? appInstanceID;
@@ -30,7 +30,7 @@ class Options {
     sessionGeneration,
   );
 
-  bool get hasExactV6SessionIdentity =>
+  bool get hasExactSessionIdentity =>
       installationID != null &&
       installationID!.trim().isNotEmpty &&
       appInstanceID != null &&

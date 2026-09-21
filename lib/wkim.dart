@@ -30,11 +30,18 @@ class WKIM {
 
   Future<bool> setup(Options opts) async {
     if (opts.protoVersion != currentProtocolVersion ||
-        !opts.hasExactV6SessionIdentity) {
+        !opts.hasExactSessionIdentity) {
       return false;
     }
     final generation = ++_setupGeneration;
     final identity = opts.sessionIdentity;
+    if (options.sessionIdentity != identity) {
+      // A credential rotation must fence the old socket before replacing the
+      // process-global options. Otherwise a delayed KICK for the revoked
+      // session can be delivered to listeners registered for the replacement
+      // session and incorrectly log out the active account.
+      connectionManager.prepareForSessionSetup();
+    }
     options = opts;
     deviceFlagApp = opts.deviceFlag;
     eventManager.reset();

@@ -230,6 +230,7 @@ void main() {
 Future<Map<int, String>> _assetMigrations() async {
   final versions = (await File('assets/sql.txt').readAsString())
       .split(';')
+      .map((value) => value.trim())
       .where((value) => value.isNotEmpty)
       .map(int.parse);
   return {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:wukongimfluttersdk/common/options.dart';
@@ -65,6 +66,7 @@ void main() {
       const envelope =
           '{"type":1,"app":{"sender":"principal-42"},"content":"hello"}';
       final first = WKMsg()
+        ..originalPayloadSHA256 = 'untrusted-caller-claim'
         ..fromUID = 'principal-42'
         ..channelID = 'peer'
         ..clientMsgNO = 'caller-first'
@@ -88,6 +90,9 @@ void main() {
         orderBy: 'order_seq',
       );
       expect(rows.map((row) => row['content']), [envelope, envelope]);
+      const expectedHash = '04bd04233ba14bf5f20175c90b9628fa77eae10a373f61b9364365b400732ca1';
+      expect(rows.map((row) => row['original_payload_sha256']), [expectedHash, expectedHash]);
+      expect(first.originalPayloadSHA256, expectedHash);
       expect(rows.map((row) => row['from_uid']), [
         'principal-42',
         'principal-42',
@@ -131,6 +136,7 @@ void main() {
       expect(await WKDBHelper.shared.getDB()!.query('conversation'), isEmpty);
       expect(message.clientSeq, 0);
       expect(message.orderSeq, 0);
+      expect(message.originalPayloadSHA256, isEmpty);
       expect(message.clientMsgNO, identity);
     },
   );
@@ -145,6 +151,7 @@ void main() {
       final duplicate = WKMsg()
         ..channelID = 'peer'
         ..contentType = 1
+        ..content = 'a different request under the same key'
         ..clientMsgNO = first.clientMsgNO;
       await expectLater(
         WKIM.shared.messageManager.saveOutgoingMessage(duplicate),
@@ -154,6 +161,7 @@ void main() {
       expect(rows, hasLength(1));
       expect(rows.single['client_msg_no'], first.clientMsgNO);
       expect(rows.single['is_deleted'], 0);
+      expect(rows.single['original_payload_sha256'], first.originalPayloadSHA256);
       expect(duplicate.clientMsgNO, first.clientMsgNO);
       expect(duplicate.clientSeq, 0);
       expect(duplicate.orderSeq, 0);
@@ -332,6 +340,11 @@ void main() {
         'uids': ['peer'],
       });
       expect(wire.containsKey('localPath'), isFalse);
+      final sentHash = sha256.convert(utf8.encode(connection.sent.single.content)).toString();
+      expect(connection.sent.single.originalPayloadSHA256, sentHash);
+      expect(connection.persisted.single.single['original_payload_sha256'], sentHash);
+      expect(sentHash, isNot(sha256.convert(utf8.encode(
+        connection.persisted.single.single['content']! as String)).toString()));
       final saved = jsonDecode(
         connection.persisted.single.single['content']! as String,
       );

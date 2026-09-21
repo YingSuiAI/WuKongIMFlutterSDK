@@ -16,23 +16,25 @@ class WKCMDManager {
   late final HashMap<String, Function(WKCMD)> _cmdListeners;
 
   /// 处理从服务器接收的命令
-  void handleCMD(dynamic json) {
+  void handleCMD(
+    dynamic json, {
+    String fromUID = '',
+    String channelID = '',
+    int channelType = 0,
+  }) {
     // 解析命令
     String cmd = WKDBConst.readString(json, 'cmd');
     dynamic param = json['param'];
-    
-    // 补充频道信息（如果缺失）
-    if (param != null && param is Map) {
-      if (!param.containsKey('channel_id')) {
-        param['channel_id'] = json['channel_id'];
-        param['channel_type'] = json['channel_type'];
-      }
-    }
-    
+
+    // Application parameters remain byte-shape faithful. Trusted origin is
+    // carried separately; inventing fields breaks closed command contracts.
     // 创建命令对象并分发
     WKCMD wkcmd = WKCMD();
     wkcmd.cmd = cmd;
     wkcmd.param = param;
+    wkcmd.fromUID = fromUID;
+    wkcmd.channelID = channelID;
+    wkcmd.channelType = channelType;
     _notifyListeners(wkcmd);
   }
 

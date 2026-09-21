@@ -12,6 +12,7 @@ import 'package:wukongimfluttersdk/entity/msg.dart';
 import 'package:wukongimfluttersdk/db/wk_db_helper.dart';
 import 'package:wukongimfluttersdk/manager/conversation_manager.dart';
 import 'package:wukongimfluttersdk/manager/message_manager.dart';
+import 'package:wukongimfluttersdk/model/wk_message_content.dart';
 import 'package:wukongimfluttersdk/proto/packet.dart';
 import 'package:wukongimfluttersdk/proto/proto.dart';
 import 'package:wukongimfluttersdk/type/const.dart';
@@ -114,12 +115,15 @@ void main() {
   });
 
   test(
-    'SEND waits for authenticated CONNACK without requiring conversation sync',
+    'SEND rejects a pre-CONNACK socket instead of returning a false pending',
     () async {
       WKIM.shared.conversationManager = originalConversations;
       WKIM.shared.connectionManager.connect();
       await _eventually(() => sockets.length == 1 && proto.connects == 1);
-      await WKIM.shared.connectionManager.sendMessage(message(1, 'pre-auth'));
+      await expectLater(
+        WKIM.shared.connectionManager.sendMessage(message(1, 'pre-auth')),
+        throwsStateError,
+      );
       expect(proto.sends, isEmpty);
       proto.nextPacket = ConnackPacket(
         reasonCode: 1,
@@ -127,7 +131,8 @@ void main() {
         salt: '0123456789abcdef',
       )..header.packetType = PacketType.connack;
       sockets.single.add([PacketType.connack.index << 4, 0]);
-      await _eventually(() => proto.sends.isNotEmpty);
+      await _eventually(() => WKIM.shared.connectionManager.isReadyForSending);
+      await WKIM.shared.connectionManager.sendMessage(message(1, 'pre-auth'));
       expect(proto.sends, ['pre-auth']);
     },
   );
@@ -147,10 +152,45 @@ void main() {
     () async {
       await connect();
       WKIM.shared.options.uid = 'bob';
-      await WKIM.shared.connectionManager.sendMessage(message(2, 'bob-2'));
+      await expectLater(
+        WKIM.shared.connectionManager.sendMessage(message(2, 'bob-2')),
+        throwsStateError,
+      );
       expect(proto.sends, isEmpty);
       await connect();
+      await WKIM.shared.connectionManager.sendMessage(message(2, 'bob-2'));
       expect(proto.sends, ['bob-2']);
+    },
+  );
+
+  test(
+    'credential setup retires its old socket without a terminal callback',
+    () async {
+      await connect();
+      final statuses = <int>[];
+      WKIM.shared.connectionManager.addOnConnectionStatus(
+        'credential-rotation',
+        (status, _, __) => statuses.add(status),
+      );
+
+      final replacement =
+          Options.newDefault(
+              'alice',
+              'replacement-token',
+              addr: '127.0.0.1:${server.port}',
+            )
+            ..installationID = 'installation'
+            ..appInstanceID = 'instance'
+            ..installationGeneration = 1
+            ..sessionGeneration = 2
+            ..proto = proto;
+      expect(await WKIM.shared.setup(replacement), isTrue);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(statuses, isEmpty);
+      WKIM.shared.connectionManager.removeOnConnectionStatus(
+        'credential-rotation',
+      );
     },
   );
 
@@ -310,6 +350,7 @@ BEGIN SELECT RAISE(FAIL, 'test projection failure'); END
         ..fromUID = 'product-principal'
         ..channelID = 'peer';
       final localSeq = await originalMessages.saveMsg(outgoing);
+      await originalMessages.updateSendResult('43', localSeq, 11, 1);
       proto.nextPacket = receive()
         ..messageID = BigInt.from(43)
         ..messageSeq = 11
@@ -325,6 +366,7 @@ BEGIN SELECT RAISE(FAIL, 'test projection failure'); END
       expect(echo.single['from_uid'], 'product-principal');
       expect(echo.single['client_msg_no'], 'own-echo');
       expect(echo.single['message_id'], '43');
+      expect(echo.single['content'], '{"type":1,"content":"received"}');
       expect(await db.query('message'), hasLength(2));
       expect((await db.query('conversation')).single['unread_count'], 1);
     },
@@ -404,6 +446,7 @@ class _Messages implements WKMessageManager {
     int clientSeq,
     int messageSeq,
     int reasonCode, {
+    String applicationMessageID = '',
     bool Function()? isCurrent,
   }) async {
     ackAttempts++;
@@ -413,6 +456,12 @@ class _Messages implements WKMessageManager {
 
   @override
   Future<void> updateSendingMsgFail() async {}
+
+  @override
+  void registerMsgContent(
+    int type,
+    WKMessageContent Function(dynamic data) createMsgContent,
+  ) {}
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);

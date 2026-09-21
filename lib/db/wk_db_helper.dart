@@ -116,10 +116,11 @@ class WKDBHelper {
     List<String> names = path.split(';');
     final migrations = <int, String>{};
     for (int i = 0; i < names.length; i++) {
-      if (names[i] == '') {
+      final name = names[i].trim();
+      if (name.isEmpty) {
         continue;
       }
-      int version = int.parse(names[i]);
+      int version = int.parse(name);
       migrations[version] = await rootBundle.loadString(
         'packages/wukongimfluttersdk/assets/$version.sql',
       );
