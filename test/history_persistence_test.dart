@@ -234,7 +234,7 @@ void main() {
   });
 
   test(
-    'history API reports a failed write through its error callback',
+    'public manager history API forwards a failed write without a page',
     () async {
       final listenerReady = Completer<void>();
       late void Function(WKSyncChannelMsg?) deliver;
@@ -252,13 +252,14 @@ void main() {
       });
       final failed = Completer<Object>();
       var returnedPage = false;
-      final invocation = MessageDB.shared.getOrSyncHistoryMessages(
+      final invocation = WKIM.shared.messageManager.getOrSyncHistoryMessages(
         'peer',
         1,
         0,
         false,
         0,
         20,
+        0,
         (_) => returnedPage = true,
         () {},
         onError: (error, _) => failed.complete(error),

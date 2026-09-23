@@ -439,7 +439,7 @@ class WKMessageManager {
      * @param limit                    每次获取数量
      * @param iGetOrSyncHistoryMsgBack 请求返还
      */
-  getOrSyncHistoryMessages(
+  Future<void> getOrSyncHistoryMessages(
       String channelId,
       int channelType,
       int oldestOrderSeq,
@@ -448,7 +448,8 @@ class WKMessageManager {
       int limit,
       int aroundMsgOrderSeq,
       final Function(List<WKMsg>) iGetOrSyncHistoryMsgBack,
-      final Function() syncBack) async {
+      final Function() syncBack,
+      {void Function(Object, StackTrace)? onError}) async {
     if (aroundMsgOrderSeq != 0) {
       int maxMsgSeq = await getMaxMessageSeq(channelId, channelType);
       int aroundMsgSeq = getOrNearbyMsgSeq(aroundMsgOrderSeq);
@@ -489,7 +490,7 @@ class WKMessageManager {
         contain = true;
       }
     }
-    MessageDB.shared.getOrSyncHistoryMessages(
+    await MessageDB.shared.getOrSyncHistoryMessages(
         channelId,
         channelType,
         oldestOrderSeq,
@@ -497,7 +498,8 @@ class WKMessageManager {
         pullMode,
         limit,
         iGetOrSyncHistoryMsgBack,
-        syncBack);
+        syncBack,
+        onError: onError);
   }
 
   int getOrNearbyMsgSeq(int orderSeq) {
