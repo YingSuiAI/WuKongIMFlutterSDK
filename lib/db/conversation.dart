@@ -337,7 +337,7 @@ class ConversationDB {
     return list;
   }
 
-  insetMsgs(List<WKConversationMsg> list) async {
+  Future<void> insetMsgs(List<WKConversationMsg> list) async {
     if (WKDBHelper.shared.getDB() == null) {
       return;
     }
@@ -348,7 +348,7 @@ class ConversationDB {
     await WKDBHelper.shared.getDB()?.transaction((txn) async {
       if (insertList.isNotEmpty) {
         for (int i = 0; i < insertList.length; i++) {
-          txn.insert(WKDBConst.tableConversation, insertList[i],
+          await txn.insert(WKDBConst.tableConversation, insertList[i],
               conflictAlgorithm: ConflictAlgorithm.replace);
         }
       }
