@@ -373,7 +373,7 @@ class MessageDB {
   }
 
   var requestCount = 0;
-  void getOrSyncHistoryMessages(
+  Future<void> getOrSyncHistoryMessages(
       String channelId,
       int channelType,
       int oldestOrderSeq,
@@ -381,7 +381,30 @@ class MessageDB {
       int pullMode,
       int limit,
       final Function(List<WKMsg>) iGetOrSyncHistoryMsgBack,
-      final Function() syncBack) async {
+      final Function() syncBack,
+      {void Function(Object, StackTrace)? onError}) {
+    return _getOrSyncHistoryMessages(channelId, channelType, oldestOrderSeq,
+        contain, pullMode, limit, iGetOrSyncHistoryMsgBack, syncBack,
+        onError: onError).catchError((Object error, StackTrace stackTrace) {
+      requestCount = 0;
+      if (onError != null) {
+        onError(error, stackTrace);
+      } else {
+        Error.throwWithStackTrace(error, stackTrace);
+      }
+    });
+  }
+
+  Future<void> _getOrSyncHistoryMessages(
+      String channelId,
+      int channelType,
+      int oldestOrderSeq,
+      bool contain,
+      int pullMode,
+      int limit,
+      final Function(List<WKMsg>) iGetOrSyncHistoryMsgBack,
+      final Function() syncBack,
+      {void Function(Object, StackTrace)? onError}) async {
     //获取原始数据
     List<WKMsg> list = await getMessages(
         channelId, channelType, oldestOrderSeq, contain, pullMode, limit);
@@ -546,11 +569,15 @@ class MessageDB {
             requestCount = 5;
           }
           getOrSyncHistoryMessages(channelId, channelType, oldestOrderSeq,
-              contain, pullMode, limit, iGetOrSyncHistoryMsgBack, syncBack);
+              contain, pullMode, limit, iGetOrSyncHistoryMsgBack, syncBack,
+              onError: onError);
         } else {
           requestCount = 0;
           iGetOrSyncHistoryMsgBack(list);
         }
+      }, onPersistError: onError == null ? null : (error, stackTrace) {
+        requestCount = 0;
+        onError(error, stackTrace);
       });
     } else {
       requestCount = 0;
@@ -602,72 +629,71 @@ class MessageDB {
 
   Future<bool> insertMsgList(List<WKMsg> list) async {
     if (list.isEmpty) return true;
-    if (list.length == 1) {
-      insert(list[0]);
-      return true;
-    }
-    List<WKMsg> saveList = [];
-    for (int i = 0, size = list.length; i < size; i++) {
-      bool isExist = false;
-      for (int j = 0, len = saveList.length; j < len; j++) {
-        if (list[i].clientMsgNO == saveList[j].clientMsgNO) {
-          isExist = true;
-          break;
-        }
-      }
-      if (isExist) {
-        list[i].clientMsgNO = WKIM.shared.messageManager.generateClientMsgNo();
-        list[i].isDeleted = 1;
-      }
-      saveList.add(list[i]);
-    }
-    List<String> clientMsgNos = [];
-    List<WKMsg> existMsgList = [];
-    for (int i = 0, size = saveList.length; i < size; i++) {
-      if (clientMsgNos.length == 200) {
-        List<WKMsg> tempList = await queryWithClientMsgNos(clientMsgNos);
-        if (tempList.isNotEmpty) {
-          existMsgList.addAll(tempList);
-        }
-        clientMsgNos.clear();
-      }
-      if (saveList[i].clientMsgNO != '') {
-        clientMsgNos.add(saveList[i].clientMsgNO);
-      }
-    }
-    if (clientMsgNos.isNotEmpty) {
-      List<WKMsg> tempList = await queryWithClientMsgNos(clientMsgNos);
-      if (tempList.isNotEmpty) {
-        existMsgList.addAll(tempList);
-      }
-
-      clientMsgNos.clear();
-    }
-
-    for (WKMsg msg in saveList) {
-      for (WKMsg tempMsg in existMsgList) {
-        if (tempMsg.clientMsgNO != '' &&
-            msg.clientMsgNO != '' &&
-            tempMsg.clientMsgNO == msg.clientMsgNO) {
+    final db = WKDBHelper.shared.getDB();
+    if (db == null) throw StateError('Message database is not open.');
+    await db.transaction((txn) async {
+      for (final msg in list) {
+        final existing = msg.clientMsgNO.isEmpty
+            ? <Map<String, Object?>>[]
+            : await txn.query(
+                WKDBConst.tableMessage,
+                where: 'client_msg_no = ?',
+                whereArgs: [msg.clientMsgNO],
+                limit: 1,
+              );
+        if (existing.isNotEmpty) {
+          final row = existing.single;
+          final existingID = WKDBConst.readString(row, 'message_id');
+          final sameSource =
+              msg.payloadCommitted &&
+              msg.messageID.isNotEmpty &&
+              row['channel_id'] == msg.channelID &&
+              row['channel_type'] == msg.channelType &&
+              row['from_uid'] == msg.fromUID &&
+              (existingID.isEmpty ||
+                  existingID == '0' ||
+                  existingID == msg.messageID);
+          if (sameSource) {
+            if (WKDBConst.readInt(row, 'payload_committed') == 1 &&
+                (existingID != msg.messageID ||
+                    row['content'] != msg.content)) {
+              throw StateError('Conflicting committed message payload.');
+            }
+            final values = getMap(msg) as Map<String, Object>;
+            // History provides the authoritative body and sequence. Device-local
+            // deletion, playback, read state and send-intent proof stay local.
+            for (final field in [
+              'is_deleted',
+              'voice_status',
+              'viewed',
+              'viewed_at',
+              'extra',
+              'original_payload_sha256',
+            ]) {
+              values.remove(field);
+            }
+            await txn.update(
+              WKDBConst.tableMessage,
+              values,
+              where: 'client_seq = ?',
+              whereArgs: [row['client_seq']],
+            );
+            continue;
+          }
+          if (msg.payloadCommitted) {
+            throw StateError('Conflicting historical message identity.');
+          }
+          // Retain the existing collision behavior for unrelated messages.
           msg.isDeleted = 1;
           msg.clientMsgNO = WKIM.shared.messageManager.generateClientMsgNo();
-          break;
         }
+        await txn.insert(
+          WKDBConst.tableMessage,
+          getMap(msg),
+          conflictAlgorithm: ConflictAlgorithm.abort,
+        );
       }
-    }
-    //  insertMsgList(saveList);
-    List<Map<String, Object>> cvList = [];
-    for (WKMsg wkMsg in saveList) {
-      cvList.add(getMap(wkMsg));
-    }
-    if (cvList.isNotEmpty) {
-      await WKDBHelper.shared.getDB()!.transaction((txn) async {
-        for (int i = 0; i < cvList.length; i++) {
-          txn.insert(WKDBConst.tableMessage, cvList[i],
-              conflictAlgorithm: ConflictAlgorithm.replace);
-        }
-      });
-    }
+    });
     return true;
   }
 

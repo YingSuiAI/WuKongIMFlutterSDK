@@ -427,7 +427,8 @@ class _RecordingProto extends Proto {
 
 class _Conversations implements WKConversationManager {
   @override
-  Future<void> setSyncConversation(Function() callback) async => callback();
+  Future<void> setSyncConversation(Function() callback,
+      {bool Function()? isCurrent}) async => callback();
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

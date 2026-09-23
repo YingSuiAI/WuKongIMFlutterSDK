@@ -520,16 +520,19 @@ class WKConnectionManager {
         unawaited(
           _resendMsg(generation: generation, connectedSocket: connectedSocket),
         );
-        try {
-          WKIM.shared.conversationManager.setSyncConversation(() {
-            if (!_isCurrentSocket(generation, connectedSocket)) {
-              return;
-            }
-            setConnectionStatus(WKConnectStatus.syncCompleted);
-          });
-        } catch (e) {
-          Logs.error(e.toString());
-        }
+        unawaited(
+          WKIM.shared.conversationManager
+              .setSyncConversation(
+                () {
+                  if (!_isCurrentSocket(generation, connectedSocket)) return;
+                  setConnectionStatus(WKConnectStatus.syncCompleted);
+                },
+                isCurrent: () => _isCurrentSocket(generation, connectedSocket),
+              )
+              .catchError((Object error, StackTrace stack) {
+                Logs.error('同步会话启动失败: ${error.runtimeType}');
+              }),
+        );
 
         if (!_isCurrentSocket(generation, connectedSocket)) {
           return;

@@ -291,22 +291,44 @@ class WKMessageManager {
   }
 
   void setSyncChannelMsgListener(
-      String channelID,
-      int channelType,
-      int startMessageSeq,
-      int endMessageSeq,
-      int limit,
-      int pullMode,
-      Function(WKSyncChannelMsg?) back) async {
+    String channelID,
+    int channelType,
+    int startMessageSeq,
+    int endMessageSeq,
+    int limit,
+    int pullMode,
+    Function(WKSyncChannelMsg?) back,
+    {void Function(Object, StackTrace)? onPersistError}
+  ) async {
     if (_syncChannelMsgBack != null) {
-      _syncChannelMsgBack!(channelID, channelType, startMessageSeq,
-          endMessageSeq, limit, pullMode, (result) async {
-        if (result != null && result.messages != null) {
-          _saveSyncChannelMSGs(result.messages!).then((value) => back(result));
-        } else {
-          back(result);
-        }
-      });
+      _syncChannelMsgBack!(
+        channelID,
+        channelType,
+        startMessageSeq,
+        endMessageSeq,
+        limit,
+        pullMode,
+        (result) async {
+          if (result != null && result.messages != null) {
+            try {
+              await _saveSyncChannelMSGs(result.messages!);
+            } catch (error, stackTrace) {
+              Logs.error(
+                'Unable to persist synchronized messages: ${error.runtimeType}',
+              );
+              if (onPersistError != null) {
+                onPersistError(error, stackTrace);
+              } else {
+                back(null);
+              }
+              return;
+            }
+            back(result);
+          } else {
+            back(result);
+          }
+        },
+      );
     } else {
       Logs.error('未提供同步频道消息事件');
       back(null);
@@ -417,7 +439,7 @@ class WKMessageManager {
      * @param limit                    每次获取数量
      * @param iGetOrSyncHistoryMsgBack 请求返还
      */
-  getOrSyncHistoryMessages(
+  Future<void> getOrSyncHistoryMessages(
       String channelId,
       int channelType,
       int oldestOrderSeq,
@@ -426,7 +448,8 @@ class WKMessageManager {
       int limit,
       int aroundMsgOrderSeq,
       final Function(List<WKMsg>) iGetOrSyncHistoryMsgBack,
-      final Function() syncBack) async {
+      final Function() syncBack,
+      {void Function(Object, StackTrace)? onError}) async {
     if (aroundMsgOrderSeq != 0) {
       int maxMsgSeq = await getMaxMessageSeq(channelId, channelType);
       int aroundMsgSeq = getOrNearbyMsgSeq(aroundMsgOrderSeq);
@@ -467,7 +490,7 @@ class WKMessageManager {
         contain = true;
       }
     }
-    MessageDB.shared.getOrSyncHistoryMessages(
+    await MessageDB.shared.getOrSyncHistoryMessages(
         channelId,
         channelType,
         oldestOrderSeq,
@@ -475,7 +498,8 @@ class WKMessageManager {
         pullMode,
         limit,
         iGetOrSyncHistoryMsgBack,
-        syncBack);
+        syncBack,
+        onError: onError);
   }
 
   int getOrNearbyMsgSeq(int orderSeq) {

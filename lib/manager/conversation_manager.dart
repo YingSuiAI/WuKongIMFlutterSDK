@@ -1,12 +1,15 @@
+import 'dart:async';
 import 'dart:collection';
 import 'package:sqflite/sqflite.dart';
 
 import 'package:wukongimfluttersdk/db/message.dart';
 import 'package:wukongimfluttersdk/db/reaction.dart';
+import 'package:wukongimfluttersdk/db/wk_db_helper.dart';
 import 'package:wukongimfluttersdk/entity/msg.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
 
 import '../db/conversation.dart';
+import '../common/logs.dart';
 import '../entity/conversation.dart';
 import '../type/const.dart';
 
@@ -231,20 +234,48 @@ class WKConversationManager {
   }
 
   /// 触发同步会话操作
-  Future<void> setSyncConversation(Function() callback) async {
-    WKIM.shared.connectionManager.setConnectionStatus(WKConnectStatus.syncMsg);
-    if (_syncConversationBack != null) {
-      int version = await ConversationDB.shared.getMaxVersion();
-      String lastMsgSeqStr = await ConversationDB.shared.getLastMsgSeqs();
-      _syncConversationBack!(lastMsgSeqStr, 200, version, (msgs) {
-        _saveSyncConversation(msgs);
-        callback();
-      });
+  Future<void> setSyncConversation(Function() callback,
+      {bool Function()? isCurrent}) async {
+    if (isCurrent?.call() == false) {
+      return;
     }
+    WKIM.shared.connectionManager.setConnectionStatus(WKConnectStatus.syncMsg);
+    final sync = _syncConversationBack;
+    if (sync == null) {
+      callback();
+      return;
+    }
+    final database = WKDBHelper.shared.getDB();
+    int version = await ConversationDB.shared.getMaxVersion();
+    String lastMsgSeqStr = await ConversationDB.shared.getLastMsgSeqs();
+    if (isCurrent?.call() == false ||
+        !identical(database, WKDBHelper.shared.getDB())) {
+      return;
+    }
+    var delivered = false;
+    sync(lastMsgSeqStr, 200, version, (msgs) {
+      if (delivered || isCurrent?.call() == false ||
+          !identical(database, WKDBHelper.shared.getDB())) {
+        return;
+      }
+      delivered = true;
+      unawaited(() async {
+        try {
+          await _saveSyncConversation(msgs);
+          if (isCurrent?.call() == false ||
+              !identical(database, WKDBHelper.shared.getDB())) {
+            return;
+          }
+          callback();
+        } catch (error) {
+          Logs.error('同步会话保存失败: ${error.runtimeType}');
+        }
+      }());
+    });
   }
 
   /// 保存同步的会话数据
-  void _saveSyncConversation(WKSyncConversation? syncChat) {
+  Future<void> _saveSyncConversation(WKSyncConversation? syncChat) async {
     if (syncChat == null ||
         syncChat.conversations == null ||
         syncChat.conversations!.isEmpty) {
@@ -323,19 +354,19 @@ class WKConversationManager {
 
     // 保存各类数据到数据库
     if (msgExtraList.isNotEmpty) {
-      MessageDB.shared.insertMsgExtras(msgExtraList);
+      await MessageDB.shared.insertMsgExtras(msgExtraList);
     }
 
     if (msgList.isNotEmpty) {
-      MessageDB.shared.insertMsgList(msgList);
+      await MessageDB.shared.insertMsgList(msgList);
     }
 
     if (conversationMsgList.isNotEmpty) {
-      ConversationDB.shared.insetMsgs(conversationMsgList);
+      await ConversationDB.shared.insetMsgs(conversationMsgList);
     }
 
     if (msgReactionList.isNotEmpty) {
-      ReactionDB.shared.insertOrUpdateReactionList(msgReactionList);
+      await ReactionDB.shared.insertOrUpdateReactionList(msgReactionList);
     }
 
     // 消息少于20条时，按顺序推送新消息
