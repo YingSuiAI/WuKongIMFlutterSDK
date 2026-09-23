@@ -291,22 +291,44 @@ class WKMessageManager {
   }
 
   void setSyncChannelMsgListener(
-      String channelID,
-      int channelType,
-      int startMessageSeq,
-      int endMessageSeq,
-      int limit,
-      int pullMode,
-      Function(WKSyncChannelMsg?) back) async {
+    String channelID,
+    int channelType,
+    int startMessageSeq,
+    int endMessageSeq,
+    int limit,
+    int pullMode,
+    Function(WKSyncChannelMsg?) back,
+    {void Function(Object, StackTrace)? onPersistError}
+  ) async {
     if (_syncChannelMsgBack != null) {
-      _syncChannelMsgBack!(channelID, channelType, startMessageSeq,
-          endMessageSeq, limit, pullMode, (result) async {
-        if (result != null && result.messages != null) {
-          _saveSyncChannelMSGs(result.messages!).then((value) => back(result));
-        } else {
-          back(result);
-        }
-      });
+      _syncChannelMsgBack!(
+        channelID,
+        channelType,
+        startMessageSeq,
+        endMessageSeq,
+        limit,
+        pullMode,
+        (result) async {
+          if (result != null && result.messages != null) {
+            try {
+              await _saveSyncChannelMSGs(result.messages!);
+            } catch (error, stackTrace) {
+              Logs.error(
+                'Unable to persist synchronized messages: ${error.runtimeType}',
+              );
+              if (onPersistError != null) {
+                onPersistError(error, stackTrace);
+              } else {
+                back(null);
+              }
+              return;
+            }
+            back(result);
+          } else {
+            back(result);
+          }
+        },
+      );
     } else {
       Logs.error('未提供同步频道消息事件');
       back(null);
