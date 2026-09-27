@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:wukongimfluttersdk/db/const.dart';
@@ -15,6 +14,7 @@ import 'package:wukongimfluttersdk/proto/write_read.dart';
 import 'package:wukongimfluttersdk/wkim.dart';
 import 'package:wukongimfluttersdk/common/crypto_utils.dart';
 import '../common/logs.dart';
+import '../transport/socket_transport.dart';
 import '../entity/conversation.dart';
 import 'event_manager.dart';
 import '../proto/packet.dart';
@@ -27,96 +27,7 @@ typedef _SessionIdentity = Object;
 _SessionIdentity _currentSessionIdentity() =>
     WKIM.shared.options.sessionIdentity;
 
-class _WKSocket {
-  Socket? _socket;
-  StreamSubscription<Uint8List>? _subscription;
-  bool _isListening = false;
-  bool _closed = false;
-  bool _closeNotified = false;
-  Future<void> _writeTail = Future<void>.value();
-  Future<void>? _closeFuture;
-  _WKSocket._internal(this._socket);
-
-  factory _WKSocket.newSocket(Socket socket) {
-    return _WKSocket._internal(socket);
-  }
-
-  Future<void> close() {
-    final existing = _closeFuture;
-    if (existing != null) {
-      return existing;
-    }
-    _isListening = false;
-    _closed = true;
-    final subscription = _subscription;
-    _subscription = null;
-    final socket = _socket;
-    _socket = null;
-    if (subscription != null) {
-      unawaited(
-        subscription.cancel().then<void>(
-          (_) {},
-          onError: (error, stack) {
-            Logs.debug('取消socket监听错误: $error');
-          },
-        ),
-      );
-    }
-    socket?.destroy();
-    final closing = () async {
-      try {
-        await _writeTail;
-      } catch (e) {
-        Logs.debug('发送消息时关闭socket错误: $e');
-      }
-    }();
-    _closeFuture = closing;
-    return closing;
-  }
-
-  Future<void> send(Uint8List data) {
-    final operation = _writeTail.then((_) async {
-      final socket = _socket;
-      if (_closed || socket == null) {
-        throw StateError('The socket was closed before the send was written.');
-      }
-      try {
-        socket.add(data);
-        await socket.flush();
-      } catch (e) {
-        Logs.debug('发送消息错误$e');
-        rethrow;
-      }
-    });
-    // Keep the chain alive even when a previous operation failed.
-    _writeTail = operation.catchError((_) {});
-    return operation;
-  }
-
-  void listen(void Function(Uint8List data) onData, void Function() onClosed) {
-    if (!_isListening && _socket != null) {
-      _subscription = _socket!.listen(
-        onData,
-        onError: (err) {
-          Logs.debug('socket断开了${err.toString()}');
-          _notifyClosed(onClosed);
-        },
-        onDone: () {
-          _notifyClosed(onClosed);
-        },
-      );
-      _isListening = true;
-    }
-  }
-
-  void _notifyClosed(void Function() onClosed) {
-    if (_closeNotified || _closed) {
-      return;
-    }
-    _closeNotified = true;
-    onClosed();
-  }
-}
+typedef _WKSocket = SocketTransport;
 
 class WKConnectionManager {
   WKConnectionManager._privateConstructor();
@@ -138,6 +49,7 @@ class WKConnectionManager {
   _incomingTails = {};
   HashMap<String, Function(int, int?, ConnectionInfo?)>? _connectionListenerMap;
   _WKSocket? _socket;
+  _WKSocket? _connectingSocket;
   _WKSocket? _authenticatedSocket;
   Timer? _reconnectTimer;
   int _lifecycleGeneration = 0;
@@ -291,42 +203,25 @@ class WKConnectionManager {
     if (!_isCurrent(generation)) {
       return;
     }
-    Logs.info("连接地址--->$addr");
-    if (addr == '') {
-      _connectFail('连接地址为空', generation);
-      return;
-    }
     () async {
+      final socket = SocketTransport.connect(addr);
+      _connectingSocket = socket;
       try {
-        var addrs = addr.split(":");
-        if (addrs.length != 2) {
-          throw const FormatException('连接地址格式错误');
-        }
-        var host = addrs[0];
-        var port = int.parse(addrs[1]);
         setConnectionStatus(WKConnectStatus.connecting);
-        final socket = await Socket.connect(
-          host,
-          port,
-          timeout: const Duration(seconds: 5),
-        );
-        if (!_isCurrent(generation)) {
-          unawaited(
-            socket.close().then<void>(
-              (_) {},
-              onError: (error, stack) {
-                Logs.debug('关闭过期socket错误: $error');
-              },
-            ),
-          );
+        await socket.ready;
+        if (!_isCurrent(generation) || !identical(_connectingSocket, socket)) {
+          unawaited(socket.close());
           return;
         }
+        _connectingSocket = null;
         _closeAllTransport();
-        _socket = _WKSocket.newSocket(socket);
+        _socket = socket;
         _connectSuccess(generation);
-      } catch (e) {
-        Logs.error(e.toString());
-        _connectFail(e, generation);
+      } catch (_) {
+        if (identical(_connectingSocket, socket)) _connectingSocket = null;
+        unawaited(socket.close());
+        Logs.debug('transport_connect_failed');
+        _connectFail('transport_connect_failed', generation);
       }
     }();
   }
@@ -669,6 +564,9 @@ class WKConnectionManager {
   }
 
   void _closeAllTransport() {
+    final connecting = _connectingSocket;
+    _connectingSocket = null;
+    if (connecting != null) unawaited(connecting.close());
     _incomingTails.clear();
     _cacheData = null;
     _authenticatedSocket = null;
