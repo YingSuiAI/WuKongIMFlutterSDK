@@ -2,7 +2,7 @@ import '../proto/proto.dart';
 
 class Options {
   String? uid, token;
-  String? addr; // connect address IP:PORT
+  String? addr; // host:port, tcp://host:port, or complete ws(s):// URI
   int protoVersion = currentProtocolVersion;
   int deviceFlag = 0;
   String? installationID;
