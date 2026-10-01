@@ -761,7 +761,7 @@ class WKConnectionManager {
 
   /// Admits a message into this session's outbox. When authenticated, also waits
   /// for the socket write; before CONNACK it remains queued for authenticated send.
-  Future<void> sendMessage(WKMsg wkMsg) async {
+  Future<void> sendMessage(WKMsg wkMsg, {bool autoResend = true}) async {
     final identity = _currentSessionIdentity();
     final uid = WKIM.shared.options.uid;
     if (uid == null || uid.isEmpty) {
@@ -787,7 +787,7 @@ class WKConnectionManager {
     packet.topic = wkMsg.topicID;
     packet.expire = wkMsg.expireTime;
     packet.payload = wkMsg.content;
-    _addSendingMsg(packet, wkMsg.clientSeq);
+    _addSendingMsg(packet, wkMsg.clientSeq, autoResend: autoResend);
     await _sendPacket(packet, propagateError: true);
   }
 
@@ -1051,6 +1051,17 @@ class WKConnectionManager {
     return isDelete;
   }
 
+  /// Stop automatic replay for one ambiguous outbound identity. Its pending
+  /// ACK correlation and local row remain available for a late confirmation.
+  void retirePendingSend(String clientMsgNO) {
+    if (_sendingIdentity != _currentSessionIdentity()) return;
+    for (final pending in _sendingMsgMap.values) {
+      if (pending.sendPacket.clientMsgNO == clientMsgNO) {
+        pending.recoveryOwnedByCaller = true;
+      }
+    }
+  }
+
   Future<void> _resendMsg({int? generation, _WKSocket? connectedSocket}) async {
     _removeSendingMsg();
     if (_sendingMsgMap.isNotEmpty) {
@@ -1059,7 +1070,8 @@ class WKConnectionManager {
             _sendingIdentity != _currentSessionIdentity()) {
           return;
         }
-        if (entry.value.isCanResend &&
+        if (!entry.value.recoveryOwnedByCaller &&
+            entry.value.isCanResend &&
             !entry.value.isAcknowledging &&
             identical(_sendingMsgMap[entry.key], entry.value)) {
           Logs.debug("重发消息：${entry.value.sendPacket.clientSeq}");
@@ -1073,7 +1085,11 @@ class WKConnectionManager {
     }
   }
 
-  _addSendingMsg(SendPacket sendPacket, int databaseClientSeq) {
+  _addSendingMsg(
+    SendPacket sendPacket,
+    int databaseClientSeq, {
+    bool autoResend = true,
+  }) {
     _removeSendingMsg();
     _sendingMsgMap.removeWhere(
       (_, pending) => pending.sendPacket.clientMsgNO == sendPacket.clientMsgNO,
@@ -1081,7 +1097,7 @@ class WKConnectionManager {
     _sendingMsgMap[sendPacket.clientSeq] = SendingMsg(
       sendPacket,
       databaseClientSeq,
-    );
+    )..recoveryOwnedByCaller = !autoResend;
   }
 
   _removeSendingMsg() {
@@ -1106,7 +1122,10 @@ class WKConnectionManager {
       while (it.moveNext()) {
         var key = it.current.key;
         var wkSendingMsg = it.current.value;
-        if (!wkSendingMsg.isCanResend || wkSendingMsg.isAcknowledging) continue;
+        if (wkSendingMsg.recoveryOwnedByCaller ||
+            !wkSendingMsg.isCanResend ||
+            wkSendingMsg.isAcknowledging)
+          continue;
         if (wkSendingMsg.sendCount == 5 && wkSendingMsg.isCanResend) {
           WKIM.shared.messageManager.updateMsgStatusFail(
             wkSendingMsg.databaseClientSeq,
@@ -1142,6 +1161,7 @@ class SendingMsg {
   int sendTime = 0;
   bool isCanResend = true;
   bool isAcknowledging = false;
+  bool recoveryOwnedByCaller = false;
   SendingMsg(this.sendPacket, this.databaseClientSeq) {
     sendTime = (DateTime.now().millisecondsSinceEpoch / 1000).truncate();
   }

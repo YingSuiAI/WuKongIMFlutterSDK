@@ -100,6 +100,22 @@ void main() {
     databaseDirectory = null;
   });
 
+  test('caller-owned confirmation does not replay on reconnect', () async {
+    await connect();
+    await WKIM.shared.connectionManager.sendMessage(
+      message(1, 'unknown'),
+      autoResend: false,
+    );
+    await WKIM.shared.connectionManager.sendMessage(message(2, 'normal'));
+    WKIM.shared.connectionManager.disconnect(false);
+    await connect();
+    expect(proto.sends, ['unknown', 'normal', 'normal']);
+    WKIM.shared.connectionManager.retirePendingSend('normal');
+    WKIM.shared.connectionManager.disconnect(false);
+    await connect();
+    expect(proto.sends, ['unknown', 'normal', 'normal']);
+  });
+
   test('reconnect retains only the same session pending sends', () async {
     await connect();
     await WKIM.shared.connectionManager.sendMessage(message(1, 'alice-1'));
@@ -207,7 +223,8 @@ void main() {
 
   test('ACK requires both pending sequence and message identity', () async {
     await connect();
-    await WKIM.shared.connectionManager.sendMessage(message(3, 'current'));
+    await WKIM.shared.connectionManager.sendMessage(message(3, 'current'), autoResend: false);
+    WKIM.shared.connectionManager.retirePendingSend('current');
     final wireSeq = proto.sentPackets.single.clientSeq;
     for (final (seq, no) in [
       (9999, 'current'),
@@ -427,8 +444,10 @@ class _RecordingProto extends Proto {
 
 class _Conversations implements WKConversationManager {
   @override
-  Future<void> setSyncConversation(Function() callback,
-      {bool Function()? isCurrent}) async => callback();
+  Future<void> setSyncConversation(
+    Function() callback, {
+    bool Function()? isCurrent,
+  }) async => callback();
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
