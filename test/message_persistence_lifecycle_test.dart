@@ -385,7 +385,7 @@ class _RecordingConnection implements WKConnectionManager {
   final conversations = <List<Map<String, Object?>>>[];
 
   @override
-  Future<void> sendMessage(WKMsg message) async {
+  Future<void> sendMessage(WKMsg message, {bool autoResend = true}) async {
     persisted.add(await WKDBHelper.shared.getDB()!.query('message'));
     conversations.add(await WKDBHelper.shared.getDB()!.query('conversation'));
     sent.add(message);
