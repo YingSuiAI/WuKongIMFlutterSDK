@@ -254,6 +254,36 @@ void main() {
   });
 
   test(
+    'caller-managed send write failure retires the connection without redial',
+    () async {
+      await connect();
+      WKIM.shared.options.connectionManagedByCaller = true;
+      final failures = <WKConnectionFailureStage?>[];
+      WKIM.shared.connectionManager.addOnConnectionStatus('write-failure', (
+        status,
+        _,
+        info,
+      ) {
+        if (status == WKConnectStatus.fail) failures.add(info?.failureStage);
+      });
+      addTearDown(
+        () => WKIM.shared.connectionManager.removeOnConnectionStatus(
+          'write-failure',
+        ),
+      );
+      proto.failSend = true;
+      await expectLater(
+        WKIM.shared.connectionManager.sendMessage(message(1, 'failed')),
+        throwsStateError,
+      );
+      expect(failures, [WKConnectionFailureStage.connectionClosed]);
+      expect(WKIM.shared.connectionManager.isReadyForSending, isFalse);
+      await Future<void>.delayed(const Duration(seconds: 2));
+      expect(sockets, hasLength(1));
+    },
+  );
+
+  test(
     'explicit retry gives a new wire identity and ignores the old ACK',
     () async {
       await connect();

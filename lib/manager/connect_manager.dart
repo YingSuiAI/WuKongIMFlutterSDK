@@ -495,9 +495,13 @@ class WKConnectionManager {
           connectedSocket: connectedSocket,
         );
       } else {
-        // A rejected credential is terminal for this attempt; the embedding
-        // client may explicitly refresh it and start a new generation.
-        _wantsConnection = false;
+        // A rejected credential is terminal for this attempt only when the
+        // embedding client owns reconnect: it may explicitly refresh the
+        // credential and start a new generation. Standalone SDK users keep
+        // the default automatic recovery behavior.
+        if (WKIM.shared.options.connectionManagedByCaller) {
+          _wantsConnection = false;
+        }
         _closeAll();
         setConnectionStatus(
           WKConnectStatus.fail,
@@ -720,17 +724,15 @@ class WKConnectionManager {
     } catch (e) {
       Logs.debug('发送数据错误: $e');
       if (_isCurrentSocket(generation, connectedSocket)) {
-        if (propagateError) {
-          _scheduleReconnect(generation);
-        } else {
-          _retireFailedConnection(
-            generation,
-            packet is ConnectPacket
-                ? WKConnectionFailureStage.protocolHandshake
-                : WKConnectionFailureStage.connectionClosed,
-            connectedSocket: target,
-          );
-        }
+        // A failed write leaves the socket in an unknown state: retire it so
+        // caller-managed embedders observe the failure and own the redial.
+        _retireFailedConnection(
+          generation,
+          packet is ConnectPacket
+              ? WKConnectionFailureStage.protocolHandshake
+              : WKConnectionFailureStage.connectionClosed,
+          connectedSocket: target,
+        );
       }
       if (propagateError) rethrow;
     }

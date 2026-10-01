@@ -714,6 +714,37 @@ void main() {
       );
     },
   );
+  test(
+    'caller-managed rejected CONNACK ends automatic recovery for that attempt',
+    () async {
+      final manager = WKIM.shared.connectionManager;
+      WKIM.shared.options.connectionManagedByCaller = true;
+      var connects = 0;
+      final reasons = <int?>[];
+      manager.addOnConnectionStatus('connack-reject', (status, reason, _) {
+        if (status == WKConnectStatus.fail) reasons.add(reason);
+      });
+      addTearDown(() => manager.removeOnConnectionStatus('connack-reject'));
+      server.listen((request) async {
+        final peer = await WebSocketTransformer.upgrade(request);
+        peers.add(peer);
+        peer.listen((data) {
+          if ((data as List<int>).first >> 4 == 1) {
+            connects++;
+            peer.add(_successfulConnack(reasonCode: 2));
+          }
+        });
+      });
+      final clock = FakeAsync();
+      clock.run((_) => manager.connect());
+      await _eventuallyWithClock(() => reasons.isNotEmpty, clock);
+      expect(reasons, [2]);
+      clock.elapse(const Duration(minutes: 2));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(connects, 1);
+      expect(manager.isReadyForSending, isFalse);
+    },
+  );
   test('healthy six-second CONNACK fits the authentication budget', () async {
     final manager = WKIM.shared.connectionManager;
     WKIM.shared.options.connectionManagedByCaller = true;
@@ -747,11 +778,11 @@ void main() {
   });
 }
 
-Uint8List _successfulConnack() {
+Uint8List _successfulConnack({int reasonCode = 1}) {
   final body = WriteData()
     ..writeUint8(7)
     ..writeUint64(BigInt.zero)
-    ..writeUint8(1)
+    ..writeUint8(reasonCode)
     ..writeString(base64Encode(CryptoUtils.dhPublicKey!))
     ..writeString('1234567890123456')
     ..writeUint64(BigInt.zero);
