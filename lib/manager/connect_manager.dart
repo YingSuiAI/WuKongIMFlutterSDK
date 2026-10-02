@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:wukongimfluttersdk/db/const.dart';
@@ -52,6 +53,10 @@ class WKConnectionManager {
   _WKSocket? _connectingSocket;
   _WKSocket? _authenticatedSocket;
   Timer? _reconnectTimer;
+  Timer? _authenticationTimer;
+  int _reconnectAttempts = 0;
+  final _reconnectJitter = math.Random();
+  final authenticationTimeout = const Duration(seconds: 10);
   int _lifecycleGeneration = 0;
   bool _wantsConnection = false;
   _SessionIdentity? _connectionIdentity;
@@ -111,9 +116,11 @@ class WKConnectionManager {
       );
       return;
     }
-    if (isNetworkUnavailable) {
-      return;
-    }
+    // An explicit connection is fresh evidence (including app resume). A radio
+    // hint must not permanently forbid an actual transport attempt.
+    isNetworkUnavailable = false;
+    isReconnection = false;
+    lastConnectivityResult = null;
     _connectionIdentity = _currentSessionIdentity();
     _selectSendingSession(_connectionIdentity!);
     _wantsConnection = true;
@@ -123,6 +130,7 @@ class WKConnectionManager {
     _reconnectTimer = null;
     _cacheData = null;
     _closeAll();
+    _startCheckNetworkTimer(generation: generation);
     if (WKIM.shared.options.getAddr != null) {
       WKIM.shared.options.getAddr!((String addr) {
         if (_isCurrent(generation)) {
@@ -152,6 +160,7 @@ class WKConnectionManager {
     _reconnectTimer = null;
     isNetworkUnavailable = false;
     isReconnection = false;
+    _reconnectAttempts = 0;
     lastConnectivityResult = null;
     _closeAll();
   }
@@ -164,6 +173,7 @@ class WKConnectionManager {
     _reconnectTimer = null;
     isNetworkUnavailable = false;
     isReconnection = false;
+    _reconnectAttempts = 0;
     lastConnectivityResult = null;
     try {
       if (isLogout) {
@@ -218,10 +228,12 @@ class WKConnectionManager {
         _socket = socket;
         _connectSuccess(generation);
       } catch (_) {
+        final ownsAttempt =
+            _isCurrent(generation) && identical(_connectingSocket, socket);
         if (identical(_connectingSocket, socket)) _connectingSocket = null;
         unawaited(socket.close());
         Logs.debug('transport_connect_failed');
-        _connectFail('transport_connect_failed', generation);
+        if (ownsAttempt) _connectFail(generation);
       }
     }();
   }
@@ -249,7 +261,11 @@ class WKConnectionManager {
           );
         } catch (e) {
           Logs.debug('解析socket数据错误: $e');
-          _scheduleReconnect(generation);
+          _retireFailedConnection(
+            generation,
+            WKConnectionFailureStage.protocolFrame,
+            connectedSocket: connectedSocket,
+          );
         }
         // _decodePacket(data);
       },
@@ -258,27 +274,66 @@ class WKConnectionManager {
           Logs.debug("登出了");
           return;
         }
-        _closeAllTransport();
-        _scheduleReconnect(generation);
+        _retireFailedConnection(
+          generation,
+          WKConnectionFailureStage.connectionClosed,
+          connectedSocket: connectedSocket,
+        );
       },
     );
     // 发送连接包
+    _authenticationTimer?.cancel();
+    _authenticationTimer = Timer(authenticationTimeout, () {
+      if (_isCurrentSocket(generation, connectedSocket) &&
+          !identical(_authenticatedSocket, connectedSocket)) {
+        _retireFailedConnection(
+          generation,
+          WKConnectionFailureStage.protocolHandshake,
+          connectedSocket: connectedSocket,
+        );
+      }
+    });
     _sendConnectPacket(generation, connectedSocket);
   }
 
-  _connectFail(error, int generation) {
-    if (_isCurrent(generation)) {
-      _scheduleReconnect(generation);
-    }
+  void _connectFail(int generation) {
+    _retireFailedConnection(
+      generation,
+      WKConnectionFailureStage.transportHandshake,
+    );
+  }
+
+  void _retireFailedConnection(
+    int generation,
+    WKConnectionFailureStage stage, {
+    _WKSocket? connectedSocket,
+  }) {
+    if (!_isCurrentSocket(generation, connectedSocket)) return;
+    _stopHeartTimer();
+    _closeAllTransport();
+    setConnectionStatus(
+      WKConnectStatus.fail,
+      info: ConnectionInfo(0, failureStage: stage),
+    );
+    // A listener may synchronously retire or replace this generation.
+    if (_isCurrent(generation)) _scheduleReconnect(generation);
   }
 
   void _scheduleReconnect(int generation) {
-    if (!_isCurrent(generation) || _reconnectTimer != null) {
+    if (!_isCurrent(generation) ||
+        WKIM.shared.options.connectionManagedByCaller ||
+        isNetworkUnavailable ||
+        _reconnectTimer != null) {
       return;
     }
-    _reconnectTimer = Timer(Duration(milliseconds: reconnMilliseconds), () {
+    final attempt = math.min(_reconnectAttempts, 5);
+    final delay = math.min(reconnMilliseconds * (1 << attempt), 30000);
+    _reconnectAttempts = math.min(_reconnectAttempts + 1, 5);
+    final jittered = (delay * (0.5 + 0.5 * _reconnectJitter.nextDouble()))
+        .round();
+    _reconnectTimer = Timer(Duration(milliseconds: jittered), () {
       _reconnectTimer = null;
-      if (_isCurrent(generation)) {
+      if (_isCurrent(generation) && !isNetworkUnavailable) {
         connect();
       }
     });
@@ -299,8 +354,11 @@ class WKConnectionManager {
     } on FormatException {
       _cacheData = null;
       if (generation != null && _isCurrentSocket(generation, connectedSocket)) {
-        _closeAllTransport();
-        _scheduleReconnect(generation);
+        _retireFailedConnection(
+          generation,
+          WKConnectionFailureStage.protocolFrame,
+          connectedSocket: connectedSocket,
+        );
       }
     }
   }
@@ -396,6 +454,9 @@ class WKConnectionManager {
     if (packet.header.packetType == PacketType.connack) {
       var connackPacket = packet as ConnackPacket;
       if (connackPacket.reasonCode == 1) {
+        _authenticationTimer?.cancel();
+        _authenticationTimer = null;
+        _reconnectAttempts = 0;
         Logs.debug('连接成功！');
         CryptoUtils.setServerKeyAndSalt(
           connackPacket.serverKey,
@@ -417,13 +478,10 @@ class WKConnectionManager {
         );
         unawaited(
           WKIM.shared.conversationManager
-              .setSyncConversation(
-                () {
-                  if (!_isCurrentSocket(generation, connectedSocket)) return;
-                  setConnectionStatus(WKConnectStatus.syncCompleted);
-                },
-                isCurrent: () => _isCurrentSocket(generation, connectedSocket),
-              )
+              .setSyncConversation(() {
+                if (!_isCurrentSocket(generation, connectedSocket)) return;
+                setConnectionStatus(WKConnectStatus.syncCompleted);
+              }, isCurrent: () => _isCurrentSocket(generation, connectedSocket))
               .catchError((Object error, StackTrace stack) {
                 Logs.error('同步会话启动失败: ${error.runtimeType}');
               }),
@@ -436,12 +494,15 @@ class WKConnectionManager {
           generation: generation,
           connectedSocket: connectedSocket,
         );
-        _startCheckNetworkTimer(
-          generation: generation,
-          connectedSocket: connectedSocket,
-        );
       } else {
-        _authenticatedSocket = null;
+        // A rejected credential is terminal for this attempt only when the
+        // embedding client owns reconnect: it may explicitly refresh the
+        // credential and start a new generation. Standalone SDK users keep
+        // the default automatic recovery behavior.
+        if (WKIM.shared.options.connectionManagedByCaller) {
+          _wantsConnection = false;
+        }
+        _closeAll();
         setConnectionStatus(
           WKConnectStatus.fail,
           reasoncode: connackPacket.reasonCode,
@@ -564,6 +625,8 @@ class WKConnectionManager {
   }
 
   void _closeAllTransport() {
+    _authenticationTimer?.cancel();
+    _authenticationTimer = null;
     final connecting = _connectingSocket;
     _connectingSocket = null;
     if (connecting != null) unawaited(connecting.close());
@@ -627,7 +690,11 @@ class WKConnectionManager {
     } catch (e) {
       Logs.debug('发送连接包错误: $e');
       if (_isCurrentSocket(generation, connectedSocket)) {
-        _scheduleReconnect(generation);
+        _retireFailedConnection(
+          generation,
+          WKConnectionFailureStage.protocolHandshake,
+          connectedSocket: connectedSocket,
+        );
       }
     }
   }
@@ -657,67 +724,75 @@ class WKConnectionManager {
     } catch (e) {
       Logs.debug('发送数据错误: $e');
       if (_isCurrentSocket(generation, connectedSocket)) {
-        _scheduleReconnect(generation);
+        // A failed write leaves the socket in an unknown state: retire it so
+        // caller-managed embedders observe the failure and own the redial.
+        _retireFailedConnection(
+          generation,
+          packet is ConnectPacket
+              ? WKConnectionFailureStage.protocolHandshake
+              : WKConnectionFailureStage.connectionClosed,
+          connectedSocket: target,
+        );
       }
       if (propagateError) rethrow;
     }
   }
 
-  _startCheckNetworkTimer({int? generation, _WKSocket? connectedSocket}) {
+  _startCheckNetworkTimer({int? generation}) {
     _stopCheckNetworkTimer();
+    final lifecycle = generation ?? _lifecycleGeneration;
+    var checking = false;
     checkNetworkTimer = Timer.periodic(checkNetworkSecond, (timer) {
-      final generation = _lifecycleGeneration;
-      if (!_isCurrentSocket(generation, connectedSocket)) {
-        return;
-      }
-      var connectivityResult = _connectivity.checkConnectivity();
-      connectivityResult
-          .then((value) {
-            if (!_isCurrentSocket(generation, connectedSocket)) {
-              return;
-            }
-            /**
-         * 经过查阅 connectivity_plus 官方文档和源码确认：                                                                                                   
-          checkConnectivity() 返回的 List<ConnectivityResult> 中，ConnectivityResult.none 只会单独出现，不会和其他连接类型（如 wifi、mobile）混合在同一个列表中。官方文档原文：               
-          "The returned list is never empty. In case of no connectivity, the list contains a single element of [ConnectivityResult.none]. Note also that this is the only case where
-          ConnectivityResult.none is present."
-          参考链接：
-          - https://pub.dev/documentation/connectivity_plus_platform_interface/latest/connectivity_plus_platform_interface/ConnectivityResult.html
-          - https://github.com/fluttercommunity/plus_plugins/blob/main/packages/connectivity_plus/connectivity_plus/lib/connectivity_plus.dart
-          所以 value.contains(ConnectivityResult.none) 在真机上的判断是可靠的，不会出现混合值误触发的情况。
-          如果你是在模拟器上遇到反复触发"网络断开了"的问题，这通常是模拟器本身网络状态不稳定导致的，建议在真机上验证一下。
-        */
-            if (value.contains(ConnectivityResult.none)) {
-              isReconnection = true;
-              isNetworkUnavailable = true;
+      if (!_isCurrent(lifecycle) || checking) return;
+      checking = true;
+      unawaited(() async {
+        try {
+          final value = await _connectivity.checkConnectivity().timeout(
+            const Duration(seconds: 5),
+          );
+          if (!_isCurrent(lifecycle)) return;
+          if (value.contains(ConnectivityResult.none)) {
+            final wasUnavailable = isNetworkUnavailable;
+            isReconnection = true;
+            isNetworkUnavailable = true;
+            if (!wasUnavailable) {
               Logs.debug('网络断开了');
-              _checkSedingMsg(
-                generation: generation,
-                connectedSocket: connectedSocket,
-              );
+              _checkSedingMsg(generation: lifecycle, connectedSocket: _socket);
               setConnectionStatus(WKConnectStatus.noNetwork);
-              lastConnectivityResult = ConnectivityResult.none;
+            }
+            if (!_isCurrent(lifecycle)) return;
+            lastConnectivityResult = ConnectivityResult.none;
+            return;
+          }
+          final restored = isNetworkUnavailable;
+          final changed =
+              lastConnectivityResult != null &&
+              !value.contains(lastConnectivityResult);
+          isNetworkUnavailable = false;
+          if (value.isNotEmpty) lastConnectivityResult = value.first;
+          if (restored || changed) {
+            if (WKIM.shared.options.connectionManagedByCaller) {
+              final socket = _socket;
+              if (socket != null) {
+                _retireFailedConnection(
+                  lifecycle,
+                  WKConnectionFailureStage.connectionClosed,
+                  connectedSocket: socket,
+                );
+              }
             } else {
-              isNetworkUnavailable = false;
-              if (lastConnectivityResult != null &&
-                  !value.contains(lastConnectivityResult)) {
-                isReconnection = true;
-              }
-              if (isReconnection) {
-                isReconnection = false;
-                connect();
-              }
+              isReconnection = false;
+              connect();
             }
-            if (value.isNotEmpty) {
-              lastConnectivityResult = value[0];
-            }
-          })
-          .catchError((error) {
-            if (_isCurrentSocket(generation, connectedSocket)) {
-              Logs.debug('检查网络状态错误: $error');
-            }
-            return null;
-          });
+          }
+        } catch (error) {
+          if (_isCurrent(lifecycle)) {
+            Logs.debug('检查网络状态错误: ${error.runtimeType}');
+          }
+        } finally {
+          checking = false;
+        }
+      }());
     });
   }
 
@@ -734,10 +809,14 @@ class WKConnectionManager {
   _startHeartTimer({int? generation, _WKSocket? connectedSocket}) {
     _stopHeartTimer();
     heartTimer = Timer.periodic(heartIntervalSecond, (timer) {
+      if (!_isCurrentSocket(generation, connectedSocket)) return;
       if (unReceivePongCount > 0) {
         Logs.debug('心跳包未收到pong，重连中...');
-        isReconnection = false;
-        connect();
+        _retireFailedConnection(
+          generation ?? _lifecycleGeneration,
+          WKConnectionFailureStage.heartbeat,
+          connectedSocket: connectedSocket,
+        );
         return;
       }
       Logs.info('ping...');
@@ -761,7 +840,7 @@ class WKConnectionManager {
 
   /// Admits a message into this session's outbox. When authenticated, also waits
   /// for the socket write; before CONNACK it remains queued for authenticated send.
-  Future<void> sendMessage(WKMsg wkMsg) async {
+  Future<void> sendMessage(WKMsg wkMsg, {bool autoResend = true}) async {
     final identity = _currentSessionIdentity();
     final uid = WKIM.shared.options.uid;
     if (uid == null || uid.isEmpty) {
@@ -787,7 +866,7 @@ class WKConnectionManager {
     packet.topic = wkMsg.topicID;
     packet.expire = wkMsg.expireTime;
     packet.payload = wkMsg.content;
-    _addSendingMsg(packet, wkMsg.clientSeq);
+    _addSendingMsg(packet, wkMsg.clientSeq, autoResend: autoResend);
     await _sendPacket(packet, propagateError: true);
   }
 
@@ -1051,6 +1130,17 @@ class WKConnectionManager {
     return isDelete;
   }
 
+  /// Stop automatic replay for one ambiguous outbound identity. Its pending
+  /// ACK correlation and local row remain available for a late confirmation.
+  void retirePendingSend(String clientMsgNO) {
+    if (_sendingIdentity != _currentSessionIdentity()) return;
+    for (final pending in _sendingMsgMap.values) {
+      if (pending.sendPacket.clientMsgNO == clientMsgNO) {
+        pending.recoveryOwnedByCaller = true;
+      }
+    }
+  }
+
   Future<void> _resendMsg({int? generation, _WKSocket? connectedSocket}) async {
     _removeSendingMsg();
     if (_sendingMsgMap.isNotEmpty) {
@@ -1059,7 +1149,8 @@ class WKConnectionManager {
             _sendingIdentity != _currentSessionIdentity()) {
           return;
         }
-        if (entry.value.isCanResend &&
+        if (!entry.value.recoveryOwnedByCaller &&
+            entry.value.isCanResend &&
             !entry.value.isAcknowledging &&
             identical(_sendingMsgMap[entry.key], entry.value)) {
           Logs.debug("重发消息：${entry.value.sendPacket.clientSeq}");
@@ -1073,7 +1164,11 @@ class WKConnectionManager {
     }
   }
 
-  _addSendingMsg(SendPacket sendPacket, int databaseClientSeq) {
+  _addSendingMsg(
+    SendPacket sendPacket,
+    int databaseClientSeq, {
+    bool autoResend = true,
+  }) {
     _removeSendingMsg();
     _sendingMsgMap.removeWhere(
       (_, pending) => pending.sendPacket.clientMsgNO == sendPacket.clientMsgNO,
@@ -1081,7 +1176,7 @@ class WKConnectionManager {
     _sendingMsgMap[sendPacket.clientSeq] = SendingMsg(
       sendPacket,
       databaseClientSeq,
-    );
+    )..recoveryOwnedByCaller = !autoResend;
   }
 
   _removeSendingMsg() {
@@ -1106,7 +1201,11 @@ class WKConnectionManager {
       while (it.moveNext()) {
         var key = it.current.key;
         var wkSendingMsg = it.current.value;
-        if (!wkSendingMsg.isCanResend || wkSendingMsg.isAcknowledging) continue;
+        if (wkSendingMsg.recoveryOwnedByCaller ||
+            !wkSendingMsg.isCanResend ||
+            wkSendingMsg.isAcknowledging) {
+          continue;
+        }
         if (wkSendingMsg.sendCount == 5 && wkSendingMsg.isCanResend) {
           WKIM.shared.messageManager.updateMsgStatusFail(
             wkSendingMsg.databaseClientSeq,
@@ -1142,6 +1241,7 @@ class SendingMsg {
   int sendTime = 0;
   bool isCanResend = true;
   bool isAcknowledging = false;
+  bool recoveryOwnedByCaller = false;
   SendingMsg(this.sendPacket, this.databaseClientSeq) {
     sendTime = (DateTime.now().millisecondsSinceEpoch / 1000).truncate();
   }
@@ -1149,5 +1249,6 @@ class SendingMsg {
 
 class ConnectionInfo {
   int nodeId;
-  ConnectionInfo(this.nodeId);
+  final WKConnectionFailureStage? failureStage;
+  ConnectionInfo(this.nodeId, {this.failureStage});
 }

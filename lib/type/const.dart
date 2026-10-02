@@ -22,6 +22,7 @@ class WKChannelType {
   static const customerService = 3;
   static const community = 4;
   static const communityTopic = 5;
+
   /// WKProto request-scoped delivery channel, distinct from a business group.
   static const temporary = 8;
 }
@@ -56,4 +57,12 @@ class WKConnectStatus {
   static const int noNetwork = 5;
   //同步完成
   static const int syncCompleted = 6;
+}
+
+enum WKConnectionFailureStage {
+  transportHandshake,
+  protocolHandshake,
+  connectionClosed,
+  protocolFrame,
+  heartbeat,
 }

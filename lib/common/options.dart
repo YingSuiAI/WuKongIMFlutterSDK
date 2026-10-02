@@ -10,6 +10,10 @@ class Options {
   int installationGeneration = 0;
   int sessionGeneration = 0;
   bool debug = true;
+
+  /// The embedding client owns connection retry/backoff; message recovery is
+  /// configured separately for each SEND.
+  bool connectionManagedByCaller = false;
   Function(Function(String addr) complete)?
   getAddr; // async get connect address
   Proto proto = Proto();
